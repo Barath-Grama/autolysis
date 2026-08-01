@@ -274,9 +274,10 @@ class GeminiClient:
                 with httpx.Client(timeout=self.timeout) as client:
                     resp = client.post(url, json=payload, headers=headers)
 
-                if resp.status_code in (401, 403):
+                if resp.status_code in (401, 403) or _is_api_key_rejection(resp):
                     raise AuthenticationError(
-                        f"Gemini API rejected the configured API key (HTTP {resp.status_code})."
+                        f"Gemini API rejected the configured API key (HTTP {resp.status_code}). "
+                        f"Check GEMINI_API_KEY, or pass --offline to skip LLM calls."
                     )
 
                 resp.raise_for_status()
@@ -313,6 +314,26 @@ class GeminiClient:
             f"Gemini API call failed after {self.max_retries} attempts: "
             f"{redact_secret(str(last_exc), self.api_key)}"
         )
+
+
+def _is_api_key_rejection(response: httpx.Response) -> bool:
+    """Detect Gemini's invalid-key response, which arrives as a 400.
+
+    Verified against the live API: an invalid key returns HTTP 400
+    INVALID_ARGUMENT, not the 401/403 the status check alone assumes. Without
+    this the single most common misconfiguration surfaces as a generic
+    "rejected the request (HTTP 400); not retryable" instead of naming the key.
+    """
+    if response.status_code != 400:
+        return False
+    try:
+        message = response.json().get("error", {}).get("message", "")
+        status = response.json().get("error", {}).get("status", "")
+    except (ValueError, AttributeError):
+        message = response.text or ""
+        status = ""
+    haystack = f"{message} {status}".lower()
+    return "api key not valid" in haystack or "api_key_invalid" in haystack
 
 
 def _retry_after_seconds(response: httpx.Response) -> float | None:
@@ -1455,6 +1476,13 @@ def main(argv: list[str] | None = None) -> int:
     start = time.time()
     try:
         out_dir = run_pipeline(args.csv_path, config)
+    except AuthenticationError as exc:
+        # Deliberately not folded into AutolysisError: the routing call catches
+        # AutolysisError and falls back to offline analyses, which would turn a
+        # bad key into a silently degraded report. A rejected key is a
+        # configuration error and should stop the run and say so.
+        log.error(str(exc))
+        return 1
     except AutolysisError as exc:
         log.error(str(exc))
         return 1

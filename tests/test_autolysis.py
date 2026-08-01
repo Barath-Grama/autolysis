@@ -1104,5 +1104,83 @@ def test_committed_example_report_is_current():
         assert (example.parent / chart).is_file(), f"{chart} not committed"
 
 
+# --------------------------------------------------------------------------- #
+# Auth failures mid-pipeline (found by pointing the CLI at the live API)
+# --------------------------------------------------------------------------- #
+
+
+def _csv(tmp_path) -> Path:
+    path = tmp_path / "d.csv"
+    pd.DataFrame({"a": range(30), "b": range(30, 60)}).to_csv(path, index=False)
+    return path
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_rejected_key_mid_pipeline_exits_cleanly(tmp_path, monkeypatch, status):
+    """A revoked key used to escape run_pipeline as an uncaught traceback."""
+    monkeypatch.setenv("GEMINI_API_KEY", "revoked")
+
+    def responder(url, json=None, headers=None):
+        return httpx.Response(status, request=httpx.Request("POST", url))
+
+    with patch("httpx.Client", return_value=_mock_httpx_client(responder)):
+        rc = autolysis.main([str(_csv(tmp_path)), "-o", str(tmp_path / "out")])
+
+    assert rc == 1
+
+
+def test_invalid_key_400_is_recognised_as_an_auth_failure():
+    """The live API returns 400 INVALID_ARGUMENT for a bad key, not 401/403."""
+    client = autolysis.GeminiClient(api_key="bad", max_retries=1, base_delay=0.01)
+
+    def responder(url, json=None, headers=None):
+        return httpx.Response(
+            400,
+            request=httpx.Request("POST", url),
+            json={"error": {"message": "API key not valid. Please pass a valid API key.",
+                            "status": "INVALID_ARGUMENT"}},
+        )
+
+    with (
+        patch("httpx.Client", return_value=_mock_httpx_client(responder)),
+        pytest.raises(autolysis.AuthenticationError, match="API key"),
+    ):
+        client.generate("hello")
+
+
+def test_ordinary_400_is_not_mistaken_for_an_auth_failure():
+    """A malformed-request 400 must stay a plain non-retryable error."""
+    client = autolysis.GeminiClient(api_key="fine", max_retries=1, base_delay=0.01)
+
+    def responder(url, json=None, headers=None):
+        return httpx.Response(
+            400,
+            request=httpx.Request("POST", url),
+            json={"error": {"message": "Request contains an invalid argument.",
+                            "status": "INVALID_ARGUMENT"}},
+        )
+
+    with (
+        patch("httpx.Client", return_value=_mock_httpx_client(responder)),
+        pytest.raises(autolysis.AutolysisError, match="not retryable"),
+    ):
+        client.generate("hello")
+
+
+def test_bad_key_does_not_silently_degrade_to_an_offline_report(tmp_path, monkeypatch):
+    """Falling back to offline analyses would hide a configuration error."""
+    monkeypatch.setenv("GEMINI_API_KEY", "revoked")
+    out = tmp_path / "out"
+
+    def responder(url, json=None, headers=None):
+        return httpx.Response(403, request=httpx.Request("POST", url))
+
+    with patch("httpx.Client", return_value=_mock_httpx_client(responder)):
+        rc = autolysis.main([str(_csv(tmp_path)), "-o", str(out)])
+
+    assert rc == 1
+    assert not (out / "README.md").exists(), "a rejected key must not yield a report"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
