@@ -235,9 +235,16 @@ LICENSE                # MIT
 ## Running the tests
 
 ```bash
-pip install -r requirements.txt
+pip install -e ".[dev]"
 pytest tests/ -v
+ruff check .            # lint
+ruff format --check .   # formatting
 ```
+
+CI runs all three on every push, across Python 3.11/3.12/3.13 on Linux plus
+Windows and macOS, and gates coverage at 85%. The ruff rule set is pinned
+explicitly in `pyproject.toml` rather than inherited, so a routine tool
+upgrade cannot turn a green build red without a line of project code changing.
 
 All 151 tests mock the Gemini API (`unittest.mock`), so the suite runs fully
 offline and deterministically. Coverage includes:
