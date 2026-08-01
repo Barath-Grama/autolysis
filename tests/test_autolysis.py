@@ -20,6 +20,7 @@ import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import httpx
 import numpy as np
 import pandas as pd
 import pytest
@@ -313,6 +314,145 @@ def test_routing_prompt_contains_vocab():
     prompt = autolysis.build_routing_prompt(profile)
     for term in autolysis.ANALYSIS_VOCAB:
         assert term in prompt
+
+
+# --------------------------------------------------------------------------- #
+# Secret handling — the API key must never reach a log line or error message
+# --------------------------------------------------------------------------- #
+
+
+def _mock_httpx_client(post_impl):
+    """Build a patched httpx.Client whose .post() runs post_impl."""
+    mock_client = MagicMock()
+    mock_client.__enter__.return_value = mock_client
+    mock_client.post = post_impl
+    return mock_client
+
+
+def test_api_key_sent_as_header_not_in_url():
+    """The key belongs in x-goog-api-key; httpx puts URLs in its exception text."""
+    client = autolysis.GeminiClient(api_key="SECRET123", max_retries=1, base_delay=0.01)
+    seen = {}
+
+    def capture(url, json=None, headers=None):
+        seen["url"] = url
+        seen["headers"] = headers or {}
+        req = httpx.Request("POST", url)
+        return httpx.Response(
+            200,
+            request=req,
+            json={"candidates": [{"content": {"parts": [{"text": "ok"}]}}]},
+        )
+
+    with patch("httpx.Client", return_value=_mock_httpx_client(capture)):
+        assert client.generate("hello") == "ok"
+
+    assert "SECRET123" not in seen["url"]
+    assert seen["headers"].get("x-goog-api-key") == "SECRET123"
+
+
+def test_api_key_never_appears_in_raised_error():
+    """A failing call must not surface the key in the message the user sees."""
+    client = autolysis.GeminiClient(api_key="SECRET123", max_retries=2, base_delay=0.01)
+
+    def server_error(url, json=None, headers=None):
+        req = httpx.Request("POST", url)
+        return httpx.Response(500, request=req, text="upstream boom")
+
+    with patch("httpx.Client", return_value=_mock_httpx_client(server_error)):
+        with pytest.raises(autolysis.AutolysisError) as excinfo:
+            client.generate("hello")
+
+    # The URL no longer carries the key at all, so there is nothing left to
+    # scrub — absence is the assertion that matters, not the redaction marker.
+    assert "SECRET123" not in str(excinfo.value)
+
+
+def test_redact_secret_scrubs_an_embedded_key():
+    """Backstop for third-party error text we don't control."""
+    leaked = "connect failed for url 'https://api/x?key=SECRET123'"
+    scrubbed = autolysis.redact_secret(leaked, "SECRET123")
+    assert "SECRET123" not in scrubbed
+    assert "***REDACTED***" in scrubbed
+
+
+def test_redact_secret_is_a_noop_for_empty_key():
+    assert autolysis.redact_secret("nothing to hide", "") == "nothing to hide"
+
+
+# --------------------------------------------------------------------------- #
+# CSV encoding resilience
+# --------------------------------------------------------------------------- #
+
+
+def test_latin1_csv_is_read_not_crashed(tmp_path):
+    """Non-UTF-8 input must degrade to a fallback encoding, not raise."""
+    csv_path = tmp_path / "latin.csv"
+    csv_path.write_bytes("name,score\nCaf\xe9 Br\xfblot,5\nNa\xefve,3\n".encode("latin-1"))
+
+    df = autolysis.read_csv_resilient(csv_path)
+    assert len(df) == 2
+    assert list(df.columns) == ["name", "score"]
+
+
+def test_latin1_csv_runs_full_pipeline(tmp_path):
+    csv_path = tmp_path / "latin.csv"
+    rows = "\n".join(f"Caf\xe9 {i},{i * 3},{i % 4}" for i in range(30))
+    csv_path.write_bytes(f"name,score,bucket\n{rows}\n".encode("latin-1"))
+
+    config = autolysis.Config(api_key="", offline=True, output_dir=tmp_path / "out")
+    out_dir = autolysis.run_pipeline(csv_path, config)
+    assert (out_dir / "README.md").exists()
+
+
+def test_utf8_csv_still_preferred(tmp_path):
+    """UTF-8 must win outright — the fallback chain must not mangle good input."""
+    csv_path = tmp_path / "utf8.csv"
+    csv_path.write_text("name,score\nCafé Brûlot,5\n", encoding="utf-8")
+
+    df = autolysis.read_csv_resilient(csv_path)
+    assert df.loc[0, "name"] == "Café Brûlot"
+
+
+def test_malformed_csv_raises_clean_error(tmp_path):
+    """A ParserError must surface as AutolysisError, not an uncaught traceback."""
+    csv_path = tmp_path / "bad.csv"
+    csv_path.write_text('a,b\n"unterminated,1\n2,3,4,5,6\n', encoding="utf-8")
+
+    with pytest.raises(autolysis.AutolysisError):
+        autolysis.read_csv_resilient(csv_path)
+
+
+# --------------------------------------------------------------------------- #
+# --max-analyses must reach the model, not just truncate its answer
+# --------------------------------------------------------------------------- #
+
+
+def test_max_analyses_reaches_the_routing_prompt():
+    profile = {
+        "rows": 10,
+        "cols": 1,
+        "duplicate_rows": 0,
+        "columns": {"x": {"dtype": "float64", "null_pct": 0.0, "mean": 1.0, "std": 0.5, "min": 0, "max": 2}},
+    }
+    assert "Select up to 5 analyses" in autolysis.build_routing_prompt(profile, max_analyses=5)
+    assert "Select up to 2 analyses" in autolysis.build_routing_prompt(profile, max_analyses=2)
+
+
+def test_max_analyses_flows_from_cli_to_prompt(tmp_path, synthetic_df):
+    """End-to-end: the CLI flag must change the text the model actually sees."""
+    csv_path = tmp_path / "synthetic.csv"
+    synthetic_df.to_csv(csv_path, index=False)
+
+    with patch.object(autolysis.GeminiClient, "generate") as mock_generate:
+        mock_generate.side_effect = ['["correlation"]', "# Report\n\nmocked."]
+        config = autolysis.Config(
+            api_key="fake-key", max_analyses=5, output_dir=tmp_path / "out"
+        )
+        autolysis.run_pipeline(csv_path, config)
+
+    routing_prompt = mock_generate.call_args_list[0].args[0]
+    assert "Select up to 5 analyses" in routing_prompt
 
 
 if __name__ == "__main__":

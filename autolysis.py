@@ -88,6 +88,11 @@ GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 TIME_KEYWORDS = ("year", "date", "time", "month", "period", "quarter")
 CACHE_DIR = Path(".autolysis_cache")
 
+# Tried in order. Real-world CSVs are frequently Windows-Latin exports rather
+# than UTF-8; latin-1 is last because it decodes any byte sequence and so
+# always succeeds, making it the terminal fallback rather than a real guess.
+CSV_ENCODINGS = ("utf-8", "utf-8-sig", "cp1252", "latin-1")
+
 log = logging.getLogger("autolysis")
 
 
@@ -97,6 +102,18 @@ class AuthenticationError(Exception):
 
 class AutolysisError(Exception):
     """Base exception for pipeline-level failures that should abort with a message."""
+
+
+def redact_secret(text: str, secret: str) -> str:
+    """Strip an API key out of text bound for a log line or exception message.
+
+    Defence in depth: the key is sent as a header rather than a query
+    parameter, but third-party error strings are not under our control, so
+    anything user-visible is scrubbed on the way out regardless.
+    """
+    if not secret:
+        return text
+    return text.replace(secret, "***REDACTED***")
 
 
 # --------------------------------------------------------------------------- #
@@ -169,7 +186,11 @@ class GeminiClient:
 
     def generate(self, prompt: str, *, json_mode: bool = False) -> str:
         """Send a single-turn prompt to Gemini and return the text response."""
-        url = f"{GEMINI_BASE_URL}/{self.model}:generateContent?key={self.api_key}"
+        # The key travels in a header, never the URL: httpx embeds the full URL
+        # in its exception messages, so a query-string key would leak into every
+        # retry log line and error report.
+        url = f"{GEMINI_BASE_URL}/{self.model}:generateContent"
+        headers = {"x-goog-api-key": self.api_key}
         generation_config: dict[str, Any] = {"temperature": 0.4}
         if json_mode:
             generation_config["responseMimeType"] = "application/json"
@@ -185,7 +206,7 @@ class GeminiClient:
         for attempt in range(1, self.max_retries + 1):
             try:
                 with httpx.Client(timeout=self.timeout) as client:
-                    resp = client.post(url, json=payload)
+                    resp = client.post(url, json=payload, headers=headers)
 
                 if resp.status_code in (401, 403):
                     raise AuthenticationError(
@@ -201,11 +222,17 @@ class GeminiClient:
                 last_exc = exc
                 if attempt == self.max_retries:
                     break
-                log.debug("Gemini call failed (attempt %d/%d): %s", attempt, self.max_retries, exc)
+                log.debug(
+                    "Gemini call failed (attempt %d/%d): %s",
+                    attempt, self.max_retries, redact_secret(str(exc), self.api_key),
+                )
                 time.sleep(delay)
                 delay *= 2
 
-        raise AutolysisError(f"Gemini API call failed after {self.max_retries} attempts: {last_exc}")
+        raise AutolysisError(
+            f"Gemini API call failed after {self.max_retries} attempts: "
+            f"{redact_secret(str(last_exc), self.api_key)}"
+        )
 
 
 def _extract_text(data: dict) -> str:
@@ -297,7 +324,7 @@ def profile_dataset(df: pd.DataFrame) -> dict:
 # --------------------------------------------------------------------------- #
 
 
-def build_routing_prompt(profile: dict) -> str:
+def build_routing_prompt(profile: dict, max_analyses: int = 3) -> str:
     """Construct the metadata prompt for LLM analysis selection."""
     col_summaries = []
     for col, stats in profile["columns"].items():
@@ -320,7 +347,7 @@ def build_routing_prompt(profile: dict) -> str:
         f"Dataset: {profile['rows']} rows x {profile['cols']} columns "
         f"({profile['duplicate_rows']} duplicate rows).\n"
         f"Columns:\n{cols_text}\n\n"
-        f"Select up to 3 analyses most appropriate for this dataset.\n"
+        f"Select up to {max_analyses} analyses most appropriate for this dataset.\n"
         f"Respond ONLY with a JSON array from this set: [{vocab}]\n"
         f'Example: ["correlation", "outliers"]'
     )
@@ -740,14 +767,37 @@ def export_html(readme_path: Path) -> Path | None:
 # --------------------------------------------------------------------------- #
 
 
+def read_csv_resilient(csv_path: Path) -> pd.DataFrame:
+    """Read a CSV, falling back across common encodings before giving up.
+
+    pandas defaults to UTF-8 and raises UnicodeDecodeError on anything else;
+    many real datasets ship as cp1252/latin-1, so a bare read_csv turns a
+    routine file into an uncaught traceback.
+    """
+    for encoding in CSV_ENCODINGS:
+        try:
+            df = pd.read_csv(csv_path, encoding=encoding)
+        except UnicodeDecodeError:
+            continue
+        except pd.errors.EmptyDataError as exc:
+            raise AutolysisError(f"'{csv_path.name}' is empty or malformed: {exc}") from exc
+        except pd.errors.ParserError as exc:
+            raise AutolysisError(f"'{csv_path.name}' could not be parsed as CSV: {exc}") from exc
+
+        if encoding != "utf-8":
+            log.warning("%s is not valid UTF-8; decoded it as '%s'.", csv_path.name, encoding)
+        return df
+
+    raise AutolysisError(
+        f"'{csv_path.name}' could not be decoded with any of: {', '.join(CSV_ENCODINGS)}."
+    )
+
+
 def run_pipeline(csv_path: Path, config: Config) -> Path:
     if not csv_path.exists():
         raise AutolysisError(f"Input file not found: {csv_path}")
 
-    try:
-        df = pd.read_csv(csv_path)
-    except pd.errors.EmptyDataError as exc:
-        raise AutolysisError(f"'{csv_path.name}' is empty or malformed: {exc}") from exc
+    df = read_csv_resilient(csv_path)
 
     if df.empty:
         raise AutolysisError(f"'{csv_path.name}' contains zero rows; nothing to analyze.")
@@ -764,7 +814,7 @@ def run_pipeline(csv_path: Path, config: Config) -> Path:
         selected = ["correlation", "outliers"]
     else:
         client = GeminiClient(config.api_key, config.model)
-        routing_prompt = build_routing_prompt(profile)
+        routing_prompt = build_routing_prompt(profile, config.max_analyses)
         try:
             raw = cached_generate(client, routing_prompt, json_mode=True, use_cache=config.use_cache)
             selected = parse_routing_response(raw, config.max_analyses)

@@ -128,7 +128,7 @@ pip install -r requirements.txt
 pytest tests/ -v
 ```
 
-All 26 tests mock the Gemini API (`unittest.mock`), so the suite runs fully
+All 36 tests mock the Gemini API (`unittest.mock`), so the suite runs fully
 offline and deterministically. Coverage includes:
 
 - IQR outlier boundary correctness (equivalence partitioning at the Tukey fence)
@@ -139,6 +139,11 @@ offline and deterministically. Coverage includes:
 - End-to-end `README.md` generation with a mocked two-call LLM sequence
 - Graceful degradation: single numeric column, empty CSV, missing file,
   missing API key, no temporal/categorical columns
+- Secret hygiene: the API key is sent as a header and never appears in a
+  raised error, plus a redaction backstop for third-party error text
+- CSV encoding fallback: latin-1/cp1252 input is decoded rather than crashing,
+  UTF-8 still takes precedence, malformed CSVs raise a clean error
+- `--max-analyses` propagating from the CLI into the routing prompt itself
 
 ## Architecture notes
 
@@ -155,6 +160,15 @@ offline and deterministically. Coverage includes:
 - **Resilience beyond the original design.** Gemini calls retry with
   exponential backoff; if the narrative call still fails, Autolysis falls
   back to a deterministic templated report rather than crashing.
+- **Secret handling.** The API key travels in the `x-goog-api-key` header, not
+  a URL query parameter — httpx embeds the full request URL in its exception
+  messages, so a query-string key leaks into every retry log line and error
+  report. `redact_secret()` scrubs any residual occurrence as a backstop
+  against third-party error text we don't control.
+- **Encoding fallback.** Input is decoded through `utf-8 → utf-8-sig → cp1252
+  → latin-1`. pandas defaults to UTF-8 and raises on anything else, but many
+  real-world CSVs are Windows-Latin exports; a bare `read_csv` turns a routine
+  file into an uncaught traceback.
 - **`--offline` mode** runs the full local pipeline (profiling → analysis →
   chart rendering → templated report) with zero network calls, useful for
   CI, air-gapped environments, or quick demos.
