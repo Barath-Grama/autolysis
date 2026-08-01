@@ -1001,5 +1001,108 @@ def test_extract_text_error_does_not_dump_the_body():
     assert "promptFeedback" in message  # the shape is still diagnosable
 
 
+# --------------------------------------------------------------------------- #
+# Templated narrative — the keyless path, and what CI and the README show
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def rendered_results() -> dict:
+    return {
+        "correlation": {
+            "top_correlations": [{"a": "gdp", "b": "ladder", "r": 0.361}],
+            "chart": "correlation_heatmap.png",
+        },
+        "outliers": {"outlier_counts": {"ladder": 11, "gdp": 0}, "chart": "outliers_boxplot.png"},
+        "clustering": {
+            "k": 3, "silhouette": 0.4656, "x_col": "gdp", "y_col": "year",
+            "cluster_means": {0: {"gdp": 8.5, "year": 2021.55}},
+            "chart": "clustering.png",
+        },
+        "time_series": {
+            "time_col": "year", "target_col": "life_exp", "slope": -0.2972,
+            "slope_unit": "life_exp per unit of year", "direction": "decreasing",
+            "chart": "time_series_trend.png",
+        },
+        "category_analysis": {
+            "column": "country", "top_categories": {"Finland": 9}, "chart": "category_frequency.png",
+        },
+    }
+
+
+@pytest.fixture
+def sample_profile() -> dict:
+    return {
+        "rows": 144, "cols": 2, "duplicate_rows": 0,
+        "columns": {
+            "gdp": {"dtype": "float64", "null_pct": 4.2, "mean": 9.0, "std": 1.0, "min": 7, "max": 11},
+            "country": {"dtype": "object", "null_pct": 0.0, "n_unique": 16, "top_frequencies": [9]},
+        },
+    }
+
+
+def test_narrative_renders_prose_not_raw_dicts(sample_profile, rendered_results):
+    """The templated report is what every keyless run produces; it must read."""
+    report = autolysis.build_fallback_narrative(sample_profile, rendered_results, "happiness")
+
+    # No Python repr leaking into the Markdown.
+    for artefact in ("{'", "': ", "[{", "dict_", "OrderedDict"):
+        assert artefact not in report
+
+    assert "The strongest linear relationship is **gdp** vs **ladder** (r = +0.361)." in report
+    assert "| Feature A | Feature B | Pearson r |" in report
+    assert "K-Means settled on **k = 3**" in report
+    assert "life_exp per unit of year" in report
+
+
+def test_narrative_embeds_every_chart(sample_profile, rendered_results):
+    report = autolysis.build_fallback_narrative(sample_profile, rendered_results, "happiness")
+    for result in rendered_results.values():
+        assert f"]({result['chart']})" in report
+
+
+def test_narrative_recommendations_cite_numbers(sample_profile, rendered_results):
+    report = autolysis.build_fallback_narrative(sample_profile, rendered_results, "happiness")
+    tail = report.split("## What To Do With This")[1]
+    assert "review the charts above" not in tail.lower()  # the old generic filler
+    assert "r = +0.361" in tail
+    assert "11 outlying values" in tail
+
+
+def test_narrative_reports_skipped_routines(sample_profile):
+    results = {"clustering": {"skipped": True, "reason": "Fewer than 2 numeric columns"}}
+    report = autolysis.build_fallback_narrative(sample_profile, results, "tiny")
+    assert "skipped (Fewer than 2 numeric columns)" in report
+
+
+def test_narrative_survives_empty_results(sample_profile):
+    report = autolysis.build_fallback_narrative(sample_profile, {}, "empty")
+    assert "# Analysis of empty" in report
+    assert "## What To Do With This" in report
+
+
+def test_weak_correlation_gets_a_different_recommendation(sample_profile):
+    """A 0.05 correlation must not be described as worth a causal look."""
+    results = {"correlation": {"top_correlations": [{"a": "x", "b": "y", "r": 0.05}]}}
+    report = autolysis.build_fallback_narrative(sample_profile, results, "weak")
+    assert "linear structure is weak" in report
+    assert "causal look" not in report
+
+
+def test_committed_example_report_is_current():
+    """The README embeds docs/example; regenerate it if this fails."""
+    example = Path(__file__).resolve().parent.parent / "docs" / "example" / "README.md"
+    assert example.is_file(), "docs/example/README.md is missing"
+
+    body = example.read_text(encoding="utf-8")
+    assert body.startswith("# Analysis of happiness")
+    for chart in (
+        "correlation_heatmap.png", "outliers_boxplot.png", "clustering.png",
+        "time_series_trend.png", "category_frequency.png",
+    ):
+        assert chart in body, f"{chart} missing from the committed report"
+        assert (example.parent / chart).is_file(), f"{chart} not committed"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

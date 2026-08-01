@@ -26,6 +26,51 @@ CSV Input → Data Profiler → LLM Call #1 (analysis routing)
    → chart .png files → LLM Call #2 (narrative) → README.md
 ```
 
+## Example output
+
+One command, 2.4 seconds, no API key required:
+
+```bash
+python autolysis.py sample_data/happiness.csv --offline --max-analyses 5
+```
+
+<table>
+<tr>
+<td width="50%"><img src="docs/example/correlation_heatmap.png" alt="Pearson correlation heatmap across nine numeric features"></td>
+<td width="50%"><img src="docs/example/clustering.png" alt="K-Means scatter plot, k=3, coloured by cluster"></td>
+</tr>
+<tr>
+<td width="50%"><img src="docs/example/time_series_trend.png" alt="Healthy life expectancy over time with an OLS trend line"></td>
+<td width="50%"><img src="docs/example/outliers_boxplot.png" alt="Z-scored box plot showing outlier structure per feature"></td>
+</tr>
+</table>
+
+The generated report doesn't stop at the charts — it states what it found and
+what to do next, citing the numbers behind each claim:
+
+> **Correlation** — The strongest linear relationship is **Life Ladder** vs
+> **Log GDP per capita** (r = +0.361).
+>
+> **Outliers** — 13 values across 3 of 8 numeric columns fall outside 1.5x IQR
+> from the quartiles.
+>
+> **Clustering** — K-Means settled on **k = 3** over *Log GDP per capita* and
+> *year*, the two columns carrying the most cluster structure (silhouette 0.4656).
+>
+> **What to do with this**
+> 1. Probe **Life Ladder** against **Log GDP per capita** (r = +0.361) — strong
+>    enough to be worth a causal look rather than a coincidence.
+> 2. Audit the 11 outlying values in **Life Ladder** before modelling — decide
+>    whether they are data-entry errors or the signal itself.
+> 3. The 3 clusters are only weakly separated (silhouette 0.4656); treat them as
+>    a segmentation hypothesis to validate, not a finding.
+
+**→ [Read the full generated report](docs/example/README.md)**
+
+Everything above came from the `--offline` path, so it is exactly what CI
+produces on every push and what you get without a key. With `GEMINI_API_KEY`
+set, the same computed numbers are narrated by Gemini instead of the template.
+
 ## Quickstart
 
 The fastest way to run Autolysis is with [`uv`](https://docs.astral.sh/uv/), which
@@ -125,8 +170,13 @@ tests/
 sample_data/
   goodreads.csv        # synthetic book-metadata dataset for demos
   happiness.csv        # synthetic multi-year, multi-country wellbeing dataset
+docs/example/          # a committed run of the pipeline, embedded above
+  README.md            # the generated report
+  *.png                # the charts it produced
+.github/workflows/
+  ci.yml               # lint, test matrix, and an end-to-end smoke run
 requirements.txt       # pinned deps for non-uv / pip workflows
-pyproject.toml         # dev/test tooling config
+pyproject.toml         # packaging, pytest, coverage and ruff config
 .env.example           # environment variable template
 ```
 
@@ -143,7 +193,7 @@ pip install -r requirements.txt
 pytest tests/ -v
 ```
 
-All 94 tests mock the Gemini API (`unittest.mock`), so the suite runs fully
+All 101 tests mock the Gemini API (`unittest.mock`), so the suite runs fully
 offline and deterministically. Coverage includes:
 
 - IQR outlier boundary correctness (equivalence partitioning at the Tukey fence)

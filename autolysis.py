@@ -924,39 +924,218 @@ def build_narrative_prompt(profile: dict, results: dict[str, dict], dataset_name
     return "\n".join(lines)
 
 
+def _render_correlation(result: dict) -> list[str]:
+    pairs = result.get("top_correlations") or []
+    if not pairs:
+        return ["No numeric pairs produced a defined correlation."]
+    top = pairs[0]
+    lines = [
+        (
+            f"The strongest linear relationship is **{top['a']}** vs **{top['b']}** "
+            f"(r = {top['r']:+.3f})."
+        ),
+        "",
+        "| Feature A | Feature B | Pearson r |",
+        "|---|---|---:|",
+    ]
+    lines += [f"| {p['a']} | {p['b']} | {p['r']:+.3f} |" for p in pairs]
+    return lines
+
+
+def _render_outliers(result: dict) -> list[str]:
+    counts = result.get("outlier_counts") or {}
+    flagged = {k: v for k, v in counts.items() if v}
+    if not flagged:
+        return ["No values fell outside the Tukey fences in any numeric column."]
+
+    ranked = sorted(flagged.items(), key=lambda kv: kv[1], reverse=True)
+    lines = [
+        (
+            f"{sum(flagged.values())} values across {len(flagged)} of {len(counts)} numeric "
+            f"columns fall outside 1.5x IQR from the quartiles."
+        ),
+        "",
+        "| Column | Outliers |",
+        "|---|---:|",
+    ]
+    lines += [f"| {col} | {n} |" for col, n in ranked]
+    return lines
+
+
+def _render_clustering(result: dict) -> list[str]:
+    lines = [
+        (
+            f"K-Means settled on **k = {result['k']}** over *{result['x_col']}* and "
+            f"*{result['y_col']}*, the two columns carrying the most cluster structure "
+            f"(silhouette {result.get('silhouette')})."
+        ),
+    ]
+    means = result.get("cluster_means") or {}
+    if means:
+        lines += ["", f"| Cluster | {result['x_col']} | {result['y_col']} |", "|---|---:|---:|"]
+        lines += [
+            f"| {cid} | {vals[result['x_col']]} | {vals[result['y_col']]} |"
+            for cid, vals in means.items()
+        ]
+    return lines
+
+
+def _render_time_series(result: dict) -> list[str]:
+    return [
+        (
+            f"**{result['target_col']}** is {result['direction']} over *{result['time_col']}*, "
+            f"at {result['slope']:+.4f} {result.get('slope_unit', 'per unit')} on an "
+            f"ordinary-least-squares fit."
+        ),
+    ]
+
+
+def _render_category_analysis(result: dict) -> list[str]:
+    cats = result.get("top_categories") or {}
+    if not cats:
+        return ["No categorical column had a usable frequency distribution."]
+    lines = [
+        (
+            f"*{result['column']}* is the richest categorical column; its most common "
+            f"values are below."
+        ),
+        "",
+        f"| {result['column']} | Count |",
+        "|---|---:|",
+    ]
+    lines += [f"| {k} | {v} |" for k, v in cats.items()]
+    return lines
+
+
+NARRATIVE_RENDERERS: dict[str, Callable[[dict], list[str]]] = {
+    "correlation": _render_correlation,
+    "outliers": _render_outliers,
+    "clustering": _render_clustering,
+    "time_series": _render_time_series,
+    "category_analysis": _render_category_analysis,
+}
+
+
+def _render_generic(result: dict) -> list[str]:
+    """Fallback for a routine with no dedicated renderer."""
+    return [f"- **{k}**: {v}" for k, v in result.items() if k != "chart"]
+
+
+def _build_recommendations(results: dict[str, dict]) -> list[str]:
+    """Turn the computed numbers into concrete next steps.
+
+    A templated report that ends with "review the charts above" tells the
+    reader nothing they could not see. These are mechanical, but each one
+    names a column and a number.
+    """
+    recs: list[str] = []
+
+    corr = results.get("correlation", {})
+    if pairs := corr.get("top_correlations"):
+        top = pairs[0]
+        if abs(top["r"]) >= 0.3:
+            recs.append(
+                f"Probe **{top['a']}** against **{top['b']}** (r = {top['r']:+.3f}) — strong "
+                f"enough to be worth a causal look rather than a coincidence."
+            )
+        else:
+            recs.append(
+                f"No pair exceeds |r| = 0.3 (highest: {top['a']} vs {top['b']} at "
+                f"{top['r']:+.3f}), so linear structure is weak; prefer non-linear "
+                f"models or engineered features."
+            )
+
+    flagged = {k: v for k, v in (results.get("outliers", {}).get("outlier_counts") or {}).items() if v}
+    if flagged:
+        worst, n = max(flagged.items(), key=lambda kv: kv[1])
+        recs.append(
+            f"Audit the {n} outlying values in **{worst}** before modelling — decide "
+            f"whether they are data-entry errors or the signal itself."
+        )
+
+    ts = results.get("time_series", {})
+    if ts and not ts.get("skipped"):
+        recs.append(
+            f"**{ts['target_col']}** trends {ts['direction']} over {ts['time_col']}; "
+            f"confirm the trend survives segmentation before reporting it."
+        )
+
+    clust = results.get("clustering", {})
+    if clust and not clust.get("skipped"):
+        sil = clust.get("silhouette")
+        verdict = "well separated" if (sil or 0) >= 0.5 else "only weakly separated"
+        recs.append(
+            f"The {clust['k']} clusters are {verdict} (silhouette {sil}); treat them as "
+            f"a segmentation hypothesis to validate, not a finding."
+        )
+
+    return recs or ["Review the charts above alongside the source data."]
+
+
 def build_fallback_narrative(profile: dict, results: dict[str, dict], dataset_name: str) -> str:
-    """Deterministic, template-based report used when the LLM call fails or --offline is set."""
+    """Deterministic, template-based report used when the LLM call fails or --offline is set.
+
+    Renders each routine through a dedicated formatter rather than printing its
+    result dict, so the no-API-key path produces something a human would
+    actually read — this is what CI and every keyless demo sees.
+    """
+    ran = [n for n, r in results.items() if not r.get("skipped")]
+    skipped = {n: r.get("reason") for n, r in results.items() if r.get("skipped")}
+
     lines = [
         f"# Analysis of {dataset_name}",
         "",
         "## The Data",
         (
-            f"This dataset contains {profile['rows']} rows and {profile['cols']} columns "
-            f"({profile['duplicate_rows']} duplicate rows detected)."
+            f"{profile['rows']:,} rows across {profile['cols']} columns, with "
+            f"{profile['duplicate_rows']:,} duplicate rows."
         ),
-        "",
-        "## What We Did",
     ]
-    for name, result in results.items():
-        if not result.get("skipped"):
-            lines.append(f"- Ran **{name.replace('_', ' ').title()}**")
 
-    lines.append("\n## What We Found")
+    numeric = [c for c, s in profile["columns"].items() if "mean" in s]
+    categorical = [c for c, s in profile["columns"].items() if "mean" not in s]
+    lines.append(f"{len(numeric)} numeric and {len(categorical)} categorical columns were profiled.")
+
+    if incomplete := sorted(
+        ((c, s["null_pct"]) for c, s in profile["columns"].items() if s["null_pct"] > 0),
+        key=lambda kv: kv[1],
+        reverse=True,
+    )[:3]:
+        gaps = ", ".join(f"`{c}` ({pct:.1f}% null)" for c, pct in incomplete)
+        lines.append(f"Most incomplete columns: {gaps}.")
+
+    lines += ["", "## What We Did"]
+    if ran:
+        lines.append(
+            "Selected from the data's own shape — numeric arity, a detected time "
+            "column, categorical cardinality — with no model in the loop:"
+        )
+        lines += [f"- **{n.replace('_', ' ').title()}**" for n in ran]
+    for name, reason in skipped.items():
+        lines.append(f"- *{name.replace('_', ' ').title()}* — skipped ({reason})")
+
+    lines += ["", "## What We Found"]
     for name, result in results.items():
         if result.get("skipped"):
-            lines.append(f"- {name.replace('_', ' ').title()}: skipped ({result.get('reason')})")
             continue
-        lines.append(f"\n### {name.replace('_', ' ').title()}")
-        for k, v in result.items():
-            if k == "chart":
-                lines.append(f"\n![{name}]({Path(v).name})")
-            else:
-                lines.append(f"- **{k}**: {v}")
+        lines += ["", f"### {name.replace('_', ' ').title()}", ""]
+        lines += NARRATIVE_RENDERERS.get(name, _render_generic)(result)
+        if chart := result.get("chart"):
+            lines += ["", f"![{name.replace('_', ' ')}]({Path(chart).name})"]
 
-    lines.append(
-        "\n## What To Do With This\nReview the charts and figures above for "
-        "actionable, dataset-specific insights."
-    )
+    lines += ["", "## What To Do With This", ""]
+    lines += [f"{i}. {rec}" for i, rec in enumerate(_build_recommendations(results), 1)]
+    lines += [
+        "",
+        "---",
+        "",
+        (
+            "*Generated by [Autolysis](https://github.com/Barath-Grama/autolysis) in "
+            "`--offline` mode: every figure above was computed locally, with no LLM "
+            "in the loop. With a Gemini key, the same numbers are narrated by the "
+            "model instead of this template.*"
+        ),
+    ]
     return "\n".join(lines)
 
 
