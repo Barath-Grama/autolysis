@@ -536,9 +536,7 @@ def test_max_analyses_flows_from_cli_to_prompt(tmp_path, synthetic_df):
 
     with patch.object(autolysis.GeminiClient, "generate") as mock_generate:
         mock_generate.side_effect = ['["correlation"]', "# Report\n\nmocked."]
-        config = autolysis.Config(
-            api_key="fake-key", max_analyses=5, output_dir=tmp_path / "out"
-        )
+        config = autolysis.Config(api_key="fake-key", max_analyses=5, output_dir=tmp_path / "out")
         autolysis.run_pipeline(csv_path, config)
 
     routing_prompt = mock_generate.call_args_list[0].args[0]
@@ -636,9 +634,7 @@ def test_retry_after_header_is_honoured():
     client = autolysis.GeminiClient(api_key="k", max_retries=2, base_delay=99.0)
 
     def responder(url, json=None, headers=None):
-        return httpx.Response(
-            429, request=httpx.Request("POST", url), headers={"Retry-After": "0.01"}
-        )
+        return httpx.Response(429, request=httpx.Request("POST", url), headers={"Retry-After": "0.01"})
 
     with (
         patch("httpx.Client", return_value=_mock_httpx_client(responder)),
@@ -743,7 +739,7 @@ def test_sanitizer_strips_active_content(payload):
 def test_sanitizer_keeps_report_markup():
     """Sanitising must not gut the actual report."""
     markup = (
-        '<h2>Findings</h2><p><strong>r</strong> = 0.36</p>'
+        "<h2>Findings</h2><p><strong>r</strong> = 0.36</p>"
         '<img src="correlation_heatmap.png" alt="correlation">'
         '<a href="https://example.com" title="src">source</a>'
         "<table><tr><td>1</td></tr></table><pre><code>x = 1</code></pre>"
@@ -954,9 +950,9 @@ def test_sample_for_plot_caps_rows_and_is_deterministic():
 def test_top_categories_flag_reaches_the_chart(tmp_path):
     rng = np.random.default_rng(5)
     csv_path = tmp_path / "cats.csv"
-    pd.DataFrame(
-        {"label": rng.choice([f"c{i}" for i in range(12)], 200), "v": rng.normal(0, 1, 200)}
-    ).to_csv(csv_path, index=False)
+    pd.DataFrame({"label": rng.choice([f"c{i}" for i in range(12)], 200), "v": rng.normal(0, 1, 200)}).to_csv(
+        csv_path, index=False
+    )
 
     args = autolysis.build_arg_parser().parse_args(
         [str(csv_path), "--offline", "--top-categories", "3", "-o", str(tmp_path / "out")]
@@ -964,9 +960,7 @@ def test_top_categories_flag_reaches_the_chart(tmp_path):
     config = autolysis.load_config(args)
     assert config.top_n_categories == 3
 
-    result = autolysis.run_category_analysis(
-        pd.read_csv(csv_path), tmp_path, top_n=config.top_n_categories
-    )
+    result = autolysis.run_category_analysis(pd.read_csv(csv_path), tmp_path, top_n=config.top_n_categories)
     assert len(result["top_categories"]) == 3
 
 
@@ -982,9 +976,7 @@ def test_routing_uses_temperature_zero(tmp_path, synthetic_df):
 
     with patch.object(autolysis.GeminiClient, "generate") as mock_generate:
         mock_generate.side_effect = ['["correlation"]', "# R\n\ntext."]
-        autolysis.run_pipeline(
-            csv_path, autolysis.Config(api_key="k", output_dir=tmp_path / "out")
-        )
+        autolysis.run_pipeline(csv_path, autolysis.Config(api_key="k", output_dir=tmp_path / "out"))
 
     assert mock_generate.call_args_list[0].kwargs["temperature"] == 0.0
     assert mock_generate.call_args_list[1].kwargs["temperature"] == pytest.approx(0.4)
@@ -1016,17 +1008,25 @@ def rendered_results() -> dict:
         },
         "outliers": {"outlier_counts": {"ladder": 11, "gdp": 0}, "chart": "outliers_boxplot.png"},
         "clustering": {
-            "k": 3, "silhouette": 0.4656, "x_col": "gdp", "y_col": "year",
+            "k": 3,
+            "silhouette": 0.4656,
+            "x_col": "gdp",
+            "y_col": "year",
             "cluster_means": {0: {"gdp": 8.5, "year": 2021.55}},
             "chart": "clustering.png",
         },
         "time_series": {
-            "time_col": "year", "target_col": "life_exp", "slope": -0.2972,
-            "slope_unit": "life_exp per unit of year", "direction": "decreasing",
+            "time_col": "year",
+            "target_col": "life_exp",
+            "slope": -0.2972,
+            "slope_unit": "life_exp per unit of year",
+            "direction": "decreasing",
             "chart": "time_series_trend.png",
         },
         "category_analysis": {
-            "column": "country", "top_categories": {"Finland": 9}, "chart": "category_frequency.png",
+            "column": "country",
+            "top_categories": {"Finland": 9},
+            "chart": "category_frequency.png",
         },
     }
 
@@ -1034,7 +1034,9 @@ def rendered_results() -> dict:
 @pytest.fixture
 def sample_profile() -> dict:
     return {
-        "rows": 144, "cols": 2, "duplicate_rows": 0,
+        "rows": 144,
+        "cols": 2,
+        "duplicate_rows": 0,
         "columns": {
             "gdp": {"dtype": "float64", "null_pct": 4.2, "mean": 9.0, "std": 1.0, "min": 7, "max": 11},
             "country": {"dtype": "object", "null_pct": 0.0, "n_unique": 16, "top_frequencies": [9]},
@@ -1150,8 +1152,12 @@ def test_narrative_prompt_rounds_long_floats(sample_profile):
 def test_narrative_prompt_handles_all_null_numeric(sample_profile):
     """An all-null column has None for every statistic; it must not crash."""
     sample_profile["columns"]["empty"] = {
-        "dtype": "float64", "null_pct": 100.0,
-        "mean": None, "std": None, "min": None, "max": None,
+        "dtype": "float64",
+        "null_pct": 100.0,
+        "mean": None,
+        "std": None,
+        "min": None,
+        "max": None,
     }
     prompt = autolysis.build_narrative_prompt(sample_profile, {}, "d")
     assert "empty [numeric]: mean=NA" in prompt
@@ -1190,8 +1196,12 @@ def test_invalid_key_400_is_recognised_as_an_auth_failure():
         return httpx.Response(
             400,
             request=httpx.Request("POST", url),
-            json={"error": {"message": "API key not valid. Please pass a valid API key.",
-                            "status": "INVALID_ARGUMENT"}},
+            json={
+                "error": {
+                    "message": "API key not valid. Please pass a valid API key.",
+                    "status": "INVALID_ARGUMENT",
+                }
+            },
         )
 
     with (
@@ -1209,8 +1219,9 @@ def test_ordinary_400_is_not_mistaken_for_an_auth_failure():
         return httpx.Response(
             400,
             request=httpx.Request("POST", url),
-            json={"error": {"message": "Request contains an invalid argument.",
-                            "status": "INVALID_ARGUMENT"}},
+            json={
+                "error": {"message": "Request contains an invalid argument.", "status": "INVALID_ARGUMENT"}
+            },
         )
 
     with (
@@ -1268,8 +1279,9 @@ def test_usage_cost_uses_the_published_rate():
 def test_pricing_prefers_the_longest_matching_prefix():
     """'gemini-2.5-flash-lite' must not be priced as 'gemini-2.5-flash'."""
     assert autolysis.pricing_for("gemini-2.5-flash-lite") != autolysis.pricing_for("gemini-2.5-flash")
-    assert autolysis.pricing_for("gemini-2.5-flash-lite-preview-09-2025") == (
-        autolysis.MODEL_PRICING_USD_PER_MTOK["gemini-2.5-flash-lite"]
+    assert (
+        autolysis.pricing_for("gemini-2.5-flash-lite-preview-09-2025")
+        == (autolysis.MODEL_PRICING_USD_PER_MTOK["gemini-2.5-flash-lite"])
     )
 
 
@@ -1358,7 +1370,8 @@ def test_schema_reaches_the_request_payload():
     def responder(url, json=None, headers=None):
         seen.update(json)
         return httpx.Response(
-            200, request=httpx.Request("POST", url),
+            200,
+            request=httpx.Request("POST", url),
             json={"candidates": [{"content": {"parts": [{"text": "[]"}]}}]},
         )
 
@@ -1380,9 +1393,7 @@ def test_cache_key_separates_different_schemas():
 
 def test_parser_still_guards_a_schema_violating_response():
     """Belt and braces: the schema is enforced server-side, the parser locally."""
-    assert autolysis.parse_routing_response('["correlation", "not_a_real_analysis"]') == [
-        "correlation"
-    ]
+    assert autolysis.parse_routing_response('["correlation", "not_a_real_analysis"]') == ["correlation"]
 
 
 def test_readme_test_count_matches_reality(request):

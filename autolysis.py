@@ -101,7 +101,7 @@ CSV_ENCODINGS = ("utf-8", "utf-8-sig", "cp1252", "latin-1")
 # backoff just turns an instant failure into a slow one.
 RETRYABLE_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
 
-MAX_CLUSTERS = 8          # widest k considered by the silhouette sweep
+MAX_CLUSTERS = 8  # widest k considered by the silhouette sweep
 SILHOUETTE_SAMPLE_CAP = 5000  # silhouette is O(n^2); cap the rows it scores
 
 # Statistics are always computed on every row. This cap applies only to the
@@ -406,7 +406,10 @@ class GeminiClient:
                 break
             log.debug(
                 "Gemini call failed (attempt %d/%d), retrying in %.1fs: %s",
-                attempt, self.max_retries, wait, redact_secret(str(last_exc), self.api_key),
+                attempt,
+                self.max_retries,
+                wait,
+                redact_secret(str(last_exc), self.api_key),
             )
             time.sleep(wait)
             delay *= 2
@@ -456,20 +459,14 @@ def _extract_text(data: dict) -> str:
         # whole API response into a log is how prompts and content end up in
         # places nobody expects.
         shape = ", ".join(sorted(data)) if isinstance(data, dict) else type(data).__name__
-        raise AutolysisError(
-            f"Unexpected Gemini response shape (top-level keys: {shape})"
-        ) from exc
+        raise AutolysisError(f"Unexpected Gemini response shape (top-level keys: {shape})") from exc
 
 
-def _cache_key(
-    prompt: str, model: str, json_mode: bool = False, schema: dict | None = None
-) -> str:
+def _cache_key(prompt: str, model: str, json_mode: bool = False, schema: dict | None = None) -> str:
     # json_mode and the schema both change the response format, so both belong
     # in the identity of the entry or different shapes collide on one file.
     schema_part = "" if schema is None else json.dumps(schema, sort_keys=True)
-    return hashlib.sha256(
-        f"{model}:{int(json_mode)}:{schema_part}:{prompt}".encode()
-    ).hexdigest()
+    return hashlib.sha256(f"{model}:{int(json_mode)}:{schema_part}:{prompt}".encode()).hexdigest()
 
 
 def cached_generate(
@@ -1016,10 +1013,7 @@ ANALYSIS_FUNCS: dict[str, Callable[..., dict]] = {
 
 def build_narrative_prompt(profile: dict, results: dict[str, dict], dataset_name: str) -> str:
     lines = [
-        (
-            f"You are a senior data analyst. Write a Markdown report analyzing the "
-            f"dataset '{dataset_name}'."
-        ),
+        (f"You are a senior data analyst. Write a Markdown report analyzing the dataset '{dataset_name}'."),
         (
             f"The dataset has {profile['rows']} rows, {profile['cols']} columns, and "
             f"{profile['duplicate_rows']} duplicate rows."
@@ -1042,8 +1036,7 @@ def build_narrative_prompt(profile: dict, results: dict[str, dict], dataset_name
             )
         else:
             lines.append(
-                f"  - {col} [categorical]: {stats['n_unique']} distinct, "
-                f"nulls={stats['null_pct']:.1f}%"
+                f"  - {col} [categorical]: {stats['n_unique']} distinct, nulls={stats['null_pct']:.1f}%"
             )
 
     lines.append("\nAnalysis results:")
@@ -1077,10 +1070,7 @@ def _render_correlation(result: dict) -> list[str]:
         return ["No numeric pairs produced a defined correlation."]
     top = pairs[0]
     lines = [
-        (
-            f"The strongest linear relationship is **{top['a']}** vs **{top['b']}** "
-            f"(r = {top['r']:+.3f})."
-        ),
+        (f"The strongest linear relationship is **{top['a']}** vs **{top['b']}** (r = {top['r']:+.3f})."),
         "",
         "| Feature A | Feature B | Pearson r |",
         "|---|---|---:|",
@@ -1121,8 +1111,7 @@ def _render_clustering(result: dict) -> list[str]:
     if means:
         lines += ["", f"| Cluster | {result['x_col']} | {result['y_col']} |", "|---|---:|---:|"]
         lines += [
-            f"| {cid} | {vals[result['x_col']]} | {vals[result['y_col']]} |"
-            for cid, vals in means.items()
+            f"| {cid} | {vals[result['x_col']]} | {vals[result['y_col']]} |" for cid, vals in means.items()
         ]
     return lines
 
@@ -1142,10 +1131,7 @@ def _render_category_analysis(result: dict) -> list[str]:
     if not cats:
         return ["No categorical column had a usable frequency distribution."]
     lines = [
-        (
-            f"*{result['column']}* is the richest categorical column; its most common "
-            f"values are below."
-        ),
+        (f"*{result['column']}* is the richest categorical column; its most common values are below."),
         "",
         f"| {result['column']} | Count |",
         "|---|---:|",
@@ -1310,9 +1296,34 @@ def generate_narrative(
 
 ALLOWED_HTML_TAGS = frozenset(
     {
-        "h1", "h2", "h3", "h4", "h5", "h6", "p", "br", "hr", "em", "strong",
-        "code", "pre", "blockquote", "ul", "ol", "li", "table", "thead",
-        "tbody", "tr", "th", "td", "a", "img", "del", "sup", "sub",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "p",
+        "br",
+        "hr",
+        "em",
+        "strong",
+        "code",
+        "pre",
+        "blockquote",
+        "ul",
+        "ol",
+        "li",
+        "table",
+        "thead",
+        "tbody",
+        "tr",
+        "th",
+        "td",
+        "a",
+        "img",
+        "del",
+        "sup",
+        "sub",
     }
 )
 ALLOWED_HTML_ATTRS = {
@@ -1457,9 +1468,7 @@ def read_csv_resilient(csv_path: Path) -> pd.DataFrame:
             log.warning("%s is not valid UTF-8; decoded it as '%s'.", csv_path.name, encoding)
         return df
 
-    raise AutolysisError(
-        f"'{csv_path.name}' could not be decoded with any of: {', '.join(CSV_ENCODINGS)}."
-    )
+    raise AutolysisError(f"'{csv_path.name}' could not be decoded with any of: {', '.join(CSV_ENCODINGS)}.")
 
 
 def run_pipeline(csv_path: Path, config: Config) -> Path:
@@ -1551,33 +1560,44 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("csv_path", type=Path, help="Path to the CSV file to analyze.")
     parser.add_argument(
-        "-o", "--output-dir", type=Path, default=None,
+        "-o",
+        "--output-dir",
+        type=Path,
+        default=None,
         help="Output directory (default: ./<csv-stem>_output)",
     )
     parser.add_argument(
-        "-m", "--model", default=None,
+        "-m",
+        "--model",
+        default=None,
         help=f"Gemini model to use (default: env GEMINI_MODEL or '{DEFAULT_MODEL}')",
     )
     parser.add_argument(
-        "--max-analyses", type=int, default=3,
+        "--max-analyses",
+        type=int,
+        default=3,
         help="Maximum number of analyses to run (default: 3)",
     )
     parser.add_argument(
-        "--top-categories", type=int, default=8,
+        "--top-categories",
+        type=int,
+        default=8,
         help="Bars to show in the category frequency chart (default: 8)",
     )
     parser.add_argument(
-        "--offline", action="store_true",
-        help="Skip all LLM calls; choose analyses from the data shape and write "
-             "a templated report.",
+        "--offline",
+        action="store_true",
+        help="Skip all LLM calls; choose analyses from the data shape and write a templated report.",
     )
     parser.add_argument(
-        "--cache", action="store_true",
+        "--cache",
+        action="store_true",
         help="Cache LLM responses on disk (AUTOLYSIS_CACHE_DIR, default "
-             "./.autolysis_cache) to avoid repeat API calls; entries expire after 7 days.",
+        "./.autolysis_cache) to avoid repeat API calls; entries expire after 7 days.",
     )
     parser.add_argument(
-        "--html", action="store_true",
+        "--html",
+        action="store_true",
         help="Additionally render the report as a standalone report.html.",
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose (debug) logging.")

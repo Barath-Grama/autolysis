@@ -315,9 +315,7 @@ def render_report(
             picked = selections[strategy_name][dataset_name]
             marked = [f"**{p}**" if oracle.get(p) == INFORMATIVE else f"~~{p}~~" for p in picked]
             cells.append(", ".join(marked) or "—")
-        lines.append(
-            f"| `{dataset_name}` | {', '.join(worth) or '—'} | " + " | ".join(cells) + " |"
-        )
+        lines.append(f"| `{dataset_name}` | {', '.join(worth) or '—'} | " + " | ".join(cells) + " |")
 
     lines += [
         "",
@@ -336,7 +334,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--budget", type=int, default=3, help="analyses per dataset (default: 3)")
     parser.add_argument("--trials", type=int, default=1, help="LLM repeats per dataset")
     parser.add_argument(
-        "--delay", type=float, default=4.0,
+        "--delay",
+        type=float,
+        default=4.0,
         help="seconds between LLM calls, to stay inside free-tier quota (default: 4)",
     )
     parser.add_argument("--model", default=None, help="override the Gemini model")
