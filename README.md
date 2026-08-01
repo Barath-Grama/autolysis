@@ -17,8 +17,8 @@ CSV file and it will:
 4. Ask Gemini a second time to **narrate** the numeric findings into a polished,
    chart-embedded `README.md`.
 
-A typical run takes 15–40 seconds and replaces what would otherwise be hours of
-manual exploratory analysis.
+A run on the bundled sample data takes about 9 seconds end to end against
+`gemini-2.5-flash-lite` (two API calls), or under 3 seconds with `--offline`.
 
 ```
 CSV Input → Data Profiler → LLM Call #1 (analysis routing)
@@ -28,48 +28,50 @@ CSV Input → Data Profiler → LLM Call #1 (analysis routing)
 
 ## Example output
 
-One command, 2.4 seconds, no API key required:
+One command, 9.4 seconds, against the live Gemini API:
 
 ```bash
-python autolysis.py sample_data/happiness.csv --offline --max-analyses 5
+python autolysis.py sample_data/happiness.csv --max-analyses 5
 ```
+
+Offered all five analyses, the model selected **four** — correlation, outliers,
+time series and category analysis — and declined clustering for this dataset.
+That routing decision is the point: a fixed pipeline would have produced a
+fifth chart nobody asked for.
 
 <table>
 <tr>
 <td width="50%"><img src="docs/example/correlation_heatmap.png" alt="Pearson correlation heatmap across nine numeric features"></td>
-<td width="50%"><img src="docs/example/clustering.png" alt="K-Means scatter plot, k=3, coloured by cluster"></td>
+<td width="50%"><img src="docs/example/outliers_boxplot.png" alt="Z-scored box plot showing outlier structure per feature"></td>
 </tr>
 <tr>
 <td width="50%"><img src="docs/example/time_series_trend.png" alt="Healthy life expectancy over time with an OLS trend line"></td>
-<td width="50%"><img src="docs/example/outliers_boxplot.png" alt="Z-scored box plot showing outlier structure per feature"></td>
+<td width="50%"><img src="docs/example/category_frequency.png" alt="Bar chart of the most frequent country names"></td>
 </tr>
 </table>
 
-The generated report doesn't stop at the charts — it states what it found and
-what to do next, citing the numbers behind each claim:
+Gemini narrates the locally computed numbers — it never sees a data row:
 
-> **Correlation** — The strongest linear relationship is **Life Ladder** vs
-> **Log GDP per capita** (r = +0.361).
+> **Correlation** — A positive correlation of 0.361 between 'Life Ladder' and
+> 'Log GDP per capita'.
 >
-> **Outliers** — 13 values across 3 of 8 numeric columns fall outside 1.5x IQR
-> from the quartiles.
+> **Time Series** — The time series analysis for 'Healthy life expectancy at
+> birth' shows a **decreasing** trend. The slope is -0.2972, indicating a
+> decrease of 0.2972 units of 'Healthy life expectancy at birth' per unit of
+> 'year'.
 >
-> **Clustering** — K-Means settled on **k = 3** over *Log GDP per capita* and
-> *year*, the two columns carrying the most cluster structure (silhouette 0.4656).
->
-> **What to do with this**
-> 1. Probe **Life Ladder** against **Log GDP per capita** (r = +0.361) — strong
->    enough to be worth a causal look rather than a coincidence.
-> 2. Audit the 11 outlying values in **Life Ladder** before modelling — decide
->    whether they are data-entry errors or the signal itself.
-> 3. The 3 clusters are only weakly separated (silhouette 0.4656); treat them as
->    a segmentation hypothesis to validate, not a finding.
+> **Consider Corruption's Influence:** The positive correlation between 'Log
+> GDP per capita' and 'Perceptions of corruption' (0.094) is counterintuitive
+> and suggests that economic growth does not automatically reduce corruption.
+> Further research into this relationship is recommended.
 
-**→ [Read the full generated report](docs/example/README.md)**
+**→ [Read the full Gemini-generated report](docs/example/README.md)**
+&nbsp;&nbsp;|&nbsp;&nbsp;
+**[the same run without a key](docs/example-offline/README.md)**
 
-Everything above came from the `--offline` path, so it is exactly what CI
-produces on every push and what you get without a key. With `GEMINI_API_KEY`
-set, the same computed numbers are narrated by Gemini instead of the template.
+Both are committed and regenerated from the real pipeline. The keyless run is
+what CI exercises on every push: identical charts and figures, with a
+deterministic template in place of the narration.
 
 ## Quickstart
 
@@ -170,9 +172,11 @@ tests/
 sample_data/
   goodreads.csv        # synthetic book-metadata dataset for demos
   happiness.csv        # synthetic multi-year, multi-country wellbeing dataset
-docs/example/          # a committed run of the pipeline, embedded above
-  README.md            # the generated report
-  *.png                # the charts it produced
+docs/
+  example/             # a real Gemini run, embedded above
+    README.md          # the narrated report
+    *.png              # the charts the model's chosen analyses produced
+  example-offline/     # the same dataset with no API key, for comparison
 .github/workflows/
   ci.yml               # lint, test matrix, and an end-to-end smoke run
 requirements.txt       # pinned deps for non-uv / pip workflows

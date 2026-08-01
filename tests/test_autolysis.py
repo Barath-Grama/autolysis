@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -1089,19 +1090,71 @@ def test_weak_correlation_gets_a_different_recommendation(sample_profile):
     assert "causal look" not in report
 
 
-def test_committed_example_report_is_current():
-    """The README embeds docs/example; regenerate it if this fails."""
-    example = Path(__file__).resolve().parent.parent / "docs" / "example" / "README.md"
-    assert example.is_file(), "docs/example/README.md is missing"
+@pytest.mark.parametrize("example_dir", ["example", "example-offline"])
+def test_committed_example_report_is_current(example_dir):
+    """The README embeds these; regenerate them if this fails.
 
-    body = example.read_text(encoding="utf-8")
-    assert body.startswith("# Analysis of happiness")
-    for chart in (
-        "correlation_heatmap.png", "outliers_boxplot.png", "clustering.png",
-        "time_series_trend.png", "category_frequency.png",
-    ):
-        assert chart in body, f"{chart} missing from the committed report"
-        assert (example.parent / chart).is_file(), f"{chart} not committed"
+    Chart expectations are read out of the report rather than hardcoded, since
+    the Gemini run selects its own analyses and so its chart set legitimately
+    differs from the offline one.
+    """
+    report = Path(__file__).resolve().parent.parent / "docs" / example_dir / "README.md"
+    assert report.is_file(), f"docs/{example_dir}/README.md is missing"
+
+    body = report.read_text(encoding="utf-8")
+    charts = set(re.findall(r"!\[[^\]]*\]\(([^)]+\.png)\)", body))
+    assert charts, "the committed report embeds no charts"
+    for chart in charts:
+        assert (report.parent / chart).is_file(), f"{chart} referenced but not committed"
+
+    orphans = {p.name for p in report.parent.glob("*.png")} - charts
+    assert not orphans, f"charts committed but unreferenced: {sorted(orphans)}"
+
+
+def test_committed_example_contains_no_api_key():
+    """A generated artefact must never carry the key that produced it."""
+    docs = Path(__file__).resolve().parent.parent / "docs"
+    for path in docs.rglob("*"):
+        if path.is_file() and path.suffix in {".md", ".html"}:
+            assert "AIza" not in path.read_text(encoding="utf-8"), f"key-shaped string in {path}"
+
+
+# --------------------------------------------------------------------------- #
+# Narrative prompt must not invite the model to invent statistics
+# --------------------------------------------------------------------------- #
+
+
+def test_narrative_prompt_sends_min_and_max(sample_profile):
+    """Omitting them made Gemini derive a range from mean +/- std and state it.
+
+    Observed live: a 2015-2023 year column was reported as "2017 to 2022".
+    """
+    prompt = autolysis.build_narrative_prompt(sample_profile, {}, "d")
+    assert "min=" in prompt and "max=" in prompt
+
+
+def test_narrative_prompt_forbids_inferred_values(sample_profile):
+    prompt = autolysis.build_narrative_prompt(sample_profile, {}, "d")
+    assert "Use ONLY the statistics given above" in prompt
+    assert "do not derive ranges" in prompt
+
+
+def test_narrative_prompt_rounds_long_floats(sample_profile):
+    """Full float repr wastes tokens on every column, every run."""
+    sample_profile["columns"]["gdp"]["std"] = 2.591001102525183
+    prompt = autolysis.build_narrative_prompt(sample_profile, {}, "d")
+    assert "2.591001102525183" not in prompt
+    assert "2.591" in prompt
+
+
+def test_narrative_prompt_handles_all_null_numeric(sample_profile):
+    """An all-null column has None for every statistic; it must not crash."""
+    sample_profile["columns"]["empty"] = {
+        "dtype": "float64", "null_pct": 100.0,
+        "mean": None, "std": None, "min": None, "max": None,
+    }
+    prompt = autolysis.build_narrative_prompt(sample_profile, {}, "d")
+    assert "empty [numeric]: mean=NA" in prompt
 
 
 # --------------------------------------------------------------------------- #

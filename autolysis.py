@@ -914,9 +914,16 @@ def build_narrative_prompt(profile: dict, results: dict[str, dict], dataset_name
     ]
     for col, stats in profile["columns"].items():
         if "mean" in stats:
+            # min/max are sent because the model will otherwise invent a range
+            # from mean +/- std and state it as fact. Observed against the live
+            # API: a 2015-2023 year column was reported as "2017 to 2022".
+            def _num(value: float | None) -> str:
+                return "NA" if value is None else f"{value:.4g}"
+
             lines.append(
-                f"  - {col} [numeric]: mean={stats['mean']}, std={stats['std']}, "
-                f"nulls={stats['null_pct']:.1f}%"
+                f"  - {col} [numeric]: mean={_num(stats['mean'])}, "
+                f"std={_num(stats['std'])}, min={_num(stats['min'])}, "
+                f"max={_num(stats['max'])}, nulls={stats['null_pct']:.1f}%"
             )
         else:
             lines.append(
@@ -941,6 +948,10 @@ def build_narrative_prompt(profile: dict, results: dict[str, dict], dataset_name
         "embed each generated chart with ![description](chart_filename.png)), and "
         "'## What To Do With This' with actionable recommendations. "
         "Only reference charts that were actually generated. Be concise and specific."
+        "\n\nUse ONLY the statistics given above. Do not infer, estimate or state "
+        "any value that is not listed — in particular, do not derive ranges, "
+        "percentiles or counts from a mean and standard deviation. If a figure "
+        "you want is absent, omit the claim rather than approximating it."
     )
     return "\n".join(lines)
 

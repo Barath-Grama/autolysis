@@ -14,168 +14,73 @@
 </style>
 </head>
 <body>
-<h1>Analysis of happiness</h1>
+<h1>Happiness Dataset Analysis Report</h1>
 <h2>The Data</h2>
-<p>144 rows across 9 columns, with 0 duplicate rows.
-8 numeric and 1 categorical columns were profiled.
-Most incomplete columns: <code>Healthy life expectancy at birth</code> (4.2% null), <code>Generosity</code> (4.2% null), <code>Perceptions of corruption</code> (4.2% null).</p>
+<p>The dataset contains information on happiness and related factors across different countries and years. It comprises 144 rows and 9 columns. There are no duplicate rows.</p>
+<p><strong>Column Summary:</strong></p>
+<ul>
+<li><strong>Country name</strong> [categorical]: 16 distinct values, 0.0% nulls.</li>
+<li><strong>year</strong> [numeric]: Mean=2019, Std=2.591, Min=2015, Max=2023, 0.0% nulls.</li>
+<li><strong>Life Ladder</strong> [numeric]: Mean=5.721, Std=0.9762, Min=3.772, Max=7.718, 0.0% nulls.</li>
+<li><strong>Log GDP per capita</strong> [numeric]: Mean=9.24, Std=1.198, Min=7.718, Max=11.39, 0.0% nulls.</li>
+<li><strong>Social support</strong> [numeric]: Mean=0.7896, Std=0.1205, Min=0.481, Max=1, 0.0% nulls.</li>
+<li><strong>Healthy life expectancy at birth</strong> [numeric]: Mean=64.79, Std=7.925, Min=45.34, Max=85, 4.2% nulls.</li>
+<li><strong>Freedom to make life choices</strong> [numeric]: Mean=0.7501, Std=0.1505, Min=0.435, Max=1, 0.0% nulls.</li>
+<li><strong>Generosity</strong> [numeric]: Mean=0.08009, Std=0.1468, Min=-0.23, Max=0.505, 4.2% nulls.</li>
+<li><strong>Perceptions of corruption</strong> [numeric]: Mean=0.6319, Std=0.183, Min=0.083, Max=1, 4.2% nulls.</li>
+</ul>
 <h2>What We Did</h2>
-<p>Selected from the data's own shape — numeric arity, a detected time column, categorical cardinality — with no model in the loop:
-- <strong>Correlation</strong>
-- <strong>Outliers</strong>
-- <strong>Time Series</strong>
-- <strong>Category Analysis</strong>
-- <strong>Clustering</strong></p>
+<p>We performed the following analyses on the dataset:</p>
+<ul>
+<li><strong>Correlation Analysis:</strong> Examined the relationships between different variables.</li>
+<li><strong>Outlier Detection:</strong> Identified potential outliers in numerical columns.</li>
+<li><strong>Time Series Analysis:</strong> Investigated trends over time for a specific variable.</li>
+<li><strong>Category Analysis:</strong> Analyzed the frequency of categories within the 'Country name' column.</li>
+</ul>
 <h2>What We Found</h2>
 <h3>Correlation</h3>
-<p>The strongest linear relationship is <strong>Life Ladder</strong> vs <strong>Log GDP per capita</strong> (r = +0.361).</p>
-<table>
-<thead>
-<tr>
-<th>Feature A</th>
-<th>Feature B</th>
-<th>Pearson r</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>Life Ladder</td>
-<td>Log GDP per capita</td>
-<td>+0.361</td>
-</tr>
-<tr>
-<td>year</td>
-<td>Freedom to make life choices</td>
-<td>+0.177</td>
-</tr>
-<tr>
-<td>Life Ladder</td>
-<td>Social support</td>
-<td>+0.114</td>
-</tr>
-<tr>
-<td>Log GDP per capita</td>
-<td>Perceptions of corruption</td>
-<td>+0.094</td>
-</tr>
-<tr>
-<td>Social support</td>
-<td>Healthy life expectancy at birth</td>
-<td>+0.093</td>
-</tr>
-</tbody>
-</table>
-<p><img alt="correlation" src="correlation_heatmap.png" /></p>
+<p>The correlation analysis revealed several relationships:</p>
+<ul>
+<li>A positive correlation of 0.361 between 'Life Ladder' and 'Log GDP per capita'.</li>
+<li>A positive correlation of 0.177 between 'year' and 'Freedom to make life choices'.</li>
+<li>A positive correlation of 0.114 between 'Life Ladder' and 'Social support'.</li>
+<li>A positive correlation of 0.094 between 'Log GDP per capita' and 'Perceptions of corruption'.</li>
+<li>A positive correlation of 0.093 between 'Social support' and 'Healthy life expectancy at birth'.</li>
+</ul>
+<p><img alt="Correlation Heatmap" src="correlation_heatmap.png" /></p>
 <h3>Outliers</h3>
-<p>13 values across 3 of 8 numeric columns fall outside 1.5x IQR from the quartiles.</p>
-<table>
-<thead>
-<tr>
-<th>Column</th>
-<th>Outliers</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>Life Ladder</td>
-<td>11</td>
-</tr>
-<tr>
-<td>Generosity</td>
-<td>1</td>
-</tr>
-<tr>
-<td>Perceptions of corruption</td>
-<td>1</td>
-</tr>
-</tbody>
-</table>
-<p><img alt="outliers" src="outliers_boxplot.png" /></p>
+<p>Outlier detection identified the following:</p>
+<ul>
+<li>'Life Ladder' has 11 outliers.</li>
+<li>'Generosity' has 1 outlier.</li>
+<li>'Perceptions of corruption' has 1 outlier.</li>
+<li>No outliers were found in 'year', 'Log GDP per capita', 'Social support', 'Healthy life expectancy at birth', or 'Freedom to make life choices'.</li>
+</ul>
+<p><img alt="Outlier Boxplots" src="outliers_boxplot.png" /></p>
 <h3>Time Series</h3>
-<p><strong>Healthy life expectancy at birth</strong> is decreasing over <em>year</em>, at -0.2972 Healthy life expectancy at birth per unit of year on an ordinary-least-squares fit.</p>
-<p><img alt="time series" src="time_series_trend.png" /></p>
+<p>The time series analysis for 'Healthy life expectancy at birth' shows a <strong>decreasing</strong> trend. The slope is -0.2972, indicating a decrease of 0.2972 units of 'Healthy life expectancy at birth' per unit of 'year'.</p>
+<p><img alt="Time Series Trend" src="time_series_trend.png" /></p>
 <h3>Category Analysis</h3>
-<p><em>Country name</em> is the richest categorical column; its most common values are below.</p>
-<table>
-<thead>
-<tr>
-<th>Country name</th>
-<th>Count</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>Finland</td>
-<td>9</td>
-</tr>
-<tr>
-<td>Denmark</td>
-<td>9</td>
-</tr>
-<tr>
-<td>Iceland</td>
-<td>9</td>
-</tr>
-<tr>
-<td>Switzerland</td>
-<td>9</td>
-</tr>
-<tr>
-<td>Netherlands</td>
-<td>9</td>
-</tr>
-<tr>
-<td>Norway</td>
-<td>9</td>
-</tr>
-<tr>
-<td>Sweden</td>
-<td>9</td>
-</tr>
-<tr>
-<td>New Zealand</td>
-<td>9</td>
-</tr>
-</tbody>
-</table>
-<p><img alt="category analysis" src="category_frequency.png" /></p>
-<h3>Clustering</h3>
-<p>K-Means settled on <strong>k = 3</strong> over <em>Log GDP per capita</em> and <em>year</em>, the two columns carrying the most cluster structure (silhouette 0.4656).</p>
-<table>
-<thead>
-<tr>
-<th>Cluster</th>
-<th>Log GDP per capita</th>
-<th>year</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>0</td>
-<td>8.5</td>
-<td>2021.55</td>
-</tr>
-<tr>
-<td>1</td>
-<td>10.75</td>
-<td>2019.0</td>
-</tr>
-<tr>
-<td>2</td>
-<td>8.38</td>
-<td>2016.94</td>
-</tr>
-</tbody>
-</table>
-<p><img alt="clustering" src="clustering.png" /></p>
+<p>The 'Country name' column shows the following top categories by frequency:</p>
+<ul>
+<li>Finland: 9 occurrences</li>
+<li>Denmark: 9 occurrences</li>
+<li>Iceland: 9 occurrences</li>
+<li>Switzerland: 9 occurrences</li>
+<li>Netherlands: 9 occurrences</li>
+<li>Norway: 9 occurrences</li>
+<li>Sweden: 9 occurrences</li>
+<li>New Zealand: 9 occurrences</li>
+</ul>
+<p><img alt="Country Name Frequency" src="category_frequency.png" /></p>
 <h2>What To Do With This</h2>
+<p>Based on the analysis, the following actions are recommended:</p>
 <ol>
-<li>Probe <strong>Life Ladder</strong> against <strong>Log GDP per capita</strong> (r = +0.361) — strong enough to be worth a causal look rather than a coincidence.</li>
-<li>Audit the 11 outlying values in <strong>Life Ladder</strong> before modelling — decide whether they are data-entry errors or the signal itself.</li>
-<li><strong>Healthy life expectancy at birth</strong> trends decreasing over year; confirm the trend survives segmentation before reporting it.</li>
-<li>The 3 clusters are only weakly separated (silhouette 0.4656); treat them as a segmentation hypothesis to validate, not a finding.</li>
+<li><strong>Investigate Drivers of Life Ladder:</strong> Given the positive correlation between 'Life Ladder' and 'Log GDP per capita' (0.361), further analysis could explore how economic development impacts happiness. The moderate positive correlation with 'Social support' (0.114) suggests its importance, which could be a focus for interventions.</li>
+<li><strong>Address Declining Life Expectancy:</strong> The decreasing trend in 'Healthy life expectancy at birth' warrants investigation. Understanding the factors contributing to this decline is crucial for public health initiatives.</li>
+<li><strong>Explore Outlier Impacts:</strong> The identified outliers in 'Life Ladder', 'Generosity', and 'Perceptions of corruption' should be examined to understand if they represent unique cases or systemic issues that could provide valuable insights.</li>
+<li><strong>Leverage Top Performing Countries:</strong> The countries appearing frequently in the top categories (Finland, Denmark, Iceland, etc.) could serve as benchmarks. Analyzing their policies and societal structures might offer best practices for improving happiness and well-being in other nations.</li>
+<li><strong>Consider Corruption's Influence:</strong> The positive correlation between 'Log GDP per capita' and 'Perceptions of corruption' (0.094) is counterintuitive and suggests that economic growth does not automatically reduce corruption. Further research into this relationship is recommended.</li>
 </ol>
-<hr />
-<p><em>Generated by <a href="https://github.com/Barath-Grama/autolysis">Autolysis</a> in <code>--offline</code> mode: every figure above was computed locally, with no LLM in the loop. With a Gemini key, the same numbers are narrated by the model instead of this template.</em></p>
 </body>
 </html>
