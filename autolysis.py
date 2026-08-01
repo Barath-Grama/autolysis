@@ -962,6 +962,9 @@ def run_time_series(df: pd.DataFrame, out_dir: Path) -> dict:
         "slope": round(float(slope), 4),
         "slope_unit": slope_unit,
         "direction": "increasing" if slope > 0 else "decreasing" if slope < 0 else "flat",
+        # How many distinct time points the line was fitted through: a "trend"
+        # across three points is not one.
+        "n_points": len(grouped),
         "chart": str(chart_path),
     }
 
@@ -991,6 +994,7 @@ def run_category_analysis(df: pd.DataFrame, out_dir: Path, top_n: int = 8) -> di
 
     return {
         "column": target_col,
+        "n_unique": int(df[target_col].nunique(dropna=True)),
         "top_categories": {str(k): int(v) for k, v in counts.to_dict().items()},
         "chart": str(chart_path),
     }

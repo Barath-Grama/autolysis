@@ -73,6 +73,40 @@ Both are committed and regenerated from the real pipeline. The keyless run is
 what CI exercises on every push: identical charts and figures, with a
 deterministic template in place of the narration.
 
+## Does the routing actually help?
+
+Claiming a router beats a fixed pipeline is easy; measuring it is the
+interesting part. [`evals/routing_eval.py`](evals/routing_eval.py) runs nine
+synthetic datasets of deliberately varied shape — numeric-only, time-indexed,
+genuinely clustered, categorical, and several where almost nothing is
+computable — and scores each strategy against a **computed** ground truth.
+
+Hand-labelling which analyses "should" run would be circular. Instead every
+analysis is run on every dataset and its own output decides its worth:
+*informative* (a real finding), *degenerate* (a chart that says nothing — a
+heatmap of near-zero correlations, clusters with no separation), or *skipped*.
+The oracle only ever sees the result, never who chose it.
+
+| Strategy | Precision | Recall | F1 | Charts | Wasted |
+|---|---:|---:|---:|---:|---:|
+| `all` — run all five | 0.56 | 1.00 | 0.71 | 45 | **20** |
+| `heuristic` — the offline selector | 0.84 | 0.84 | 0.84 | 25 | **4** |
+| `llm` — Gemini routing | — | — | — | — | — |
+
+Running everything buys perfect recall at the cost of **20 wasted charts out of
+45** — the README's claim about meaningless charts, quantified. The shape-based
+heuristic gets 84% of the value from 55% of the charts.
+
+> **The `llm` row is honestly empty.** The Gemini free tier allows 20 requests
+> per day per model, which a nine-dataset sweep exhausts. It is shown as `—`
+> rather than 0.00, because a strategy that never ran did not score zero.
+> Re-run with quota to fill it in:
+> ```bash
+> python evals/routing_eval.py --llm --out evals/RESULTS.md
+> ```
+
+**→ [Full per-dataset results](evals/RESULTS.md)**
+
 ## Quickstart
 
 The fastest way to run Autolysis is with [`uv`](https://docs.astral.sh/uv/), which
@@ -173,6 +207,10 @@ tests/
 sample_data/
   goodreads.csv        # synthetic book-metadata dataset for demos
   happiness.csv        # synthetic multi-year, multi-country wellbeing dataset
+evals/
+  routing_eval.py      # does LLM routing beat running everything?
+  datasets.py          # nine synthetic datasets of varied shape
+  RESULTS.md           # the measured answer
 docs/
   example/             # a real Gemini run, embedded above
     README.md          # the narrated report
@@ -198,7 +236,7 @@ pip install -r requirements.txt
 pytest tests/ -v
 ```
 
-All 127 tests mock the Gemini API (`unittest.mock`), so the suite runs fully
+All 151 tests mock the Gemini API (`unittest.mock`), so the suite runs fully
 offline and deterministically. Coverage includes:
 
 - IQR outlier boundary correctness (equivalence partitioning at the Tukey fence)
