@@ -98,23 +98,114 @@ def test_outliers_counts_and_chart(synthetic_df, out_dir):
 # --------------------------------------------------------------------------- #
 
 
-def test_elbow_k_selection_plateau_at_3():
-    """WCSS drops sharply from k=2->3, then plateaus -> elbow should return k=3."""
-    inertias = {2: 300.0, 3: 100.0, 4: 90.0, 5: 85.0}
-    assert autolysis.select_k_by_elbow(inertias) == 3
+def _blobs(n_clusters: int, per_cluster: int = 60, spread: float = 0.25) -> np.ndarray:
+    """Well-separated 2-D gaussian blobs with a known cluster count."""
+    rng = np.random.default_rng(7)
+    centers = np.array([[0, 0], [10, 10], [0, 10], [10, 0], [5, 20]])[:n_clusters]
+    return np.vstack([rng.normal(c, spread, (per_cluster, 2)) for c in centers])
 
 
-def test_elbow_k_selection_plateau_at_4():
-    inertias = {2: 400.0, 3: 300.0, 4: 100.0, 5: 95.0}
-    assert autolysis.select_k_by_elbow(inertias) == 4
+def test_silhouette_recovers_two_clusters():
+    """The old elbow scored second differences and could never return k=2."""
+    best_k, scores = autolysis.select_k_by_silhouette(_blobs(2), range(2, 9))
+    assert best_k == 2
+    assert set(scores) == set(range(2, 9))
+
+
+def test_silhouette_recovers_endpoint_k():
+    """...nor the top of the range. Both endpoints must now be reachable."""
+    best_k, _ = autolysis.select_k_by_silhouette(_blobs(5), range(2, 6))
+    assert best_k == 5
+
+
+def test_silhouette_recovers_three_clusters():
+    best_k, _ = autolysis.select_k_by_silhouette(_blobs(3), range(2, 9))
+    assert best_k == 3
 
 
 def test_clustering_end_to_end(synthetic_df, out_dir):
     result = autolysis.run_clustering(synthetic_df, out_dir)
     assert not result.get("skipped")
-    assert result["k"] in {2, 3, 4, 5}
+    assert 2 <= result["k"] <= autolysis.MAX_CLUSTERS
+    assert -1.0 <= result["silhouette"] <= 1.0
     assert Path(result["chart"]).exists()
     assert Path(result["chart"]).stat().st_size > 0
+
+
+# --------------------------------------------------------------------------- #
+# Clustering axis selection must not depend on units
+# --------------------------------------------------------------------------- #
+
+
+def _bimodal(rng, n=200, sep=8.0, scale=1.0):
+    """Two separated lumps — the shape K-Means is meant to find."""
+    half = np.concatenate([rng.normal(0, 1, n // 2), rng.normal(sep, 1, n - n // 2)])
+    return half * scale
+
+
+def test_structured_columns_outrank_unimodal_noise():
+    """A bimodal column is a better clustering axis than a plain gaussian."""
+    rng = np.random.default_rng(0)
+    df = pd.DataFrame(
+        {
+            "bimodal_a": _bimodal(rng),
+            "bimodal_b": _bimodal(rng),
+            "gaussian_noise": rng.normal(0, 1, 200),
+        }
+    )
+    picked = set(autolysis.clustering_axis_scores(df).nlargest(2).index)
+    assert picked == {"bimodal_a", "bimodal_b"}
+
+
+def test_axis_selection_is_scale_free():
+    """Changing a column's units must not change which axes get picked.
+
+    Note what is deliberately *not* asserted: that a narrow gaussian loses to
+    a wide one. After standardisation those are the same data, so preferring
+    either would itself be a unit artefact — exactly the bug being fixed.
+    """
+    rng = np.random.default_rng(0)
+    df = pd.DataFrame(
+        {
+            "salary_usd": _bimodal(rng, scale=20_000.0),
+            "rating_frac": _bimodal(rng, scale=0.01),
+            "gaussian_noise": rng.normal(0, 1, 200),
+        }
+    )
+    picked = set(autolysis.clustering_axis_scores(df).nlargest(2).index)
+    assert picked == {"salary_usd", "rating_frac"}
+
+    # Same data, salary in thousands. Raw variance would reshuffle the ranking
+    # by six orders of magnitude; a scale-free score must not move at all.
+    rescaled = df.assign(salary_usd=df["salary_usd"] / 1000.0)
+    assert set(autolysis.clustering_axis_scores(rescaled).nlargest(2).index) == picked
+    assert autolysis.clustering_axis_scores(rescaled)["salary_usd"] == pytest.approx(
+        autolysis.clustering_axis_scores(df)["salary_usd"]
+    )
+
+
+def test_constant_columns_drop_out_of_axis_scores():
+    df = pd.DataFrame({"varies": [1.0, 2.0, 3.0, 8.0], "constant": [7.0] * 4})
+    scores = autolysis.clustering_axis_scores(df)
+    assert not np.isnan(scores["varies"])
+    assert np.isnan(scores["constant"])
+
+
+def test_clustering_keeps_columns_with_a_single_nan(out_dir):
+    """One missing cell must not disqualify an entire candidate axis."""
+    rng = np.random.default_rng(3)
+    df = pd.DataFrame(
+        {
+            "a": _bimodal(rng, n=60),
+            "b": _bimodal(rng, n=60),
+            "gaussian_noise": rng.normal(0, 1, 60),
+        }
+    )
+    df.loc[0, "a"] = np.nan  # a single hole in an otherwise strong column
+
+    result = autolysis.run_clustering(df, out_dir)
+    assert not result.get("skipped")
+    assert {result["x_col"], result["y_col"]} == {"a", "b"}
 
 
 # --------------------------------------------------------------------------- #
@@ -308,7 +399,7 @@ def test_routing_prompt_contains_vocab():
         "duplicate_rows": 0,
         "columns": {
             "x": {"dtype": "float64", "null_pct": 0.0, "mean": 1.0, "std": 0.5, "min": 0, "max": 2},
-            "y": {"dtype": "object", "null_pct": 0.0, "top_values": {"a": 5, "b": 5}},
+            "y": {"dtype": "object", "null_pct": 0.0, "n_unique": 2, "top_frequencies": [5, 5]},
         },
     }
     prompt = autolysis.build_routing_prompt(profile)
@@ -453,6 +544,158 @@ def test_max_analyses_flows_from_cli_to_prompt(tmp_path, synthetic_df):
 
     routing_prompt = mock_generate.call_args_list[0].args[0]
     assert "Select up to 5 analyses" in routing_prompt
+
+
+# --------------------------------------------------------------------------- #
+# Nothing identifying may reach the model
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def pii_df() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "patient_email": ["ana@x.com"] * 3 + ["bob@y.com"] * 2 + ["carl@z.com"],
+            "diagnosis": ["hypertension"] * 4 + ["diabetes"] * 2,
+            "age": [41, 52, 63, 34, 45, 56],
+        }
+    )
+
+
+def test_profile_excludes_raw_categorical_values(pii_df):
+    profile = autolysis.profile_dataset(pii_df)
+    blob = json.dumps(profile)
+    for value in ("ana@x.com", "bob@y.com", "carl@z.com", "hypertension", "diabetes"):
+        assert value not in blob
+
+
+def test_routing_prompt_excludes_raw_categorical_values(pii_df):
+    """The prompt is what actually crosses the network — assert on that."""
+    prompt = autolysis.build_routing_prompt(autolysis.profile_dataset(pii_df))
+    for value in ("ana@x.com", "bob@y.com", "carl@z.com", "hypertension", "diabetes"):
+        assert value not in prompt
+
+
+def test_narrative_prompt_excludes_raw_categorical_values(pii_df):
+    profile = autolysis.profile_dataset(pii_df)
+    prompt = autolysis.build_narrative_prompt(profile, {}, "clinic")
+    for value in ("ana@x.com", "bob@y.com", "carl@z.com"):
+        assert value not in prompt
+
+
+def test_profile_keeps_the_signal_the_router_needs(pii_df):
+    """Dropping the values must not drop cardinality or skew."""
+    cols = autolysis.profile_dataset(pii_df)["columns"]
+    assert cols["patient_email"]["n_unique"] == 3
+    assert cols["patient_email"]["top_frequencies"] == [3, 2, 1]
+    assert cols["diagnosis"]["n_unique"] == 2
+
+
+# --------------------------------------------------------------------------- #
+# Retry policy
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("status", [400, 404, 422])
+def test_non_retryable_status_fails_immediately(status):
+    """A deterministic 4xx must not be retried four times with backoff."""
+    client = autolysis.GeminiClient(api_key="k", max_retries=4, base_delay=0.01)
+    calls = []
+
+    def responder(url, json=None, headers=None):
+        calls.append(1)
+        return httpx.Response(status, request=httpx.Request("POST", url), text="nope")
+
+    with patch("httpx.Client", return_value=_mock_httpx_client(responder)):
+        with pytest.raises(autolysis.AutolysisError, match="not retryable"):
+            client.generate("hello")
+
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("status", [429, 500, 503])
+def test_retryable_status_is_retried(status):
+    client = autolysis.GeminiClient(api_key="k", max_retries=3, base_delay=0.01)
+    calls = []
+
+    def responder(url, json=None, headers=None):
+        calls.append(1)
+        return httpx.Response(status, request=httpx.Request("POST", url), text="later")
+
+    with patch("httpx.Client", return_value=_mock_httpx_client(responder)):
+        with pytest.raises(autolysis.AutolysisError):
+            client.generate("hello")
+
+    assert len(calls) == 3
+
+
+def test_retry_after_header_is_honoured():
+    client = autolysis.GeminiClient(api_key="k", max_retries=2, base_delay=99.0)
+
+    def responder(url, json=None, headers=None):
+        return httpx.Response(
+            429, request=httpx.Request("POST", url), headers={"Retry-After": "0.01"}
+        )
+
+    with patch("httpx.Client", return_value=_mock_httpx_client(responder)):
+        with patch("time.sleep") as mock_sleep:
+            with pytest.raises(autolysis.AutolysisError):
+                client.generate("hello")
+
+    # The server's 0.01s wins over our 99s backoff guess.
+    assert mock_sleep.call_args_list[0].args[0] == pytest.approx(0.01)
+
+
+def test_auth_error_still_short_circuits():
+    client = autolysis.GeminiClient(api_key="k", max_retries=4, base_delay=0.01)
+
+    def responder(url, json=None, headers=None):
+        return httpx.Response(403, request=httpx.Request("POST", url))
+
+    with patch("httpx.Client", return_value=_mock_httpx_client(responder)):
+        with pytest.raises(autolysis.AuthenticationError):
+            client.generate("hello")
+
+
+# --------------------------------------------------------------------------- #
+# Time-series regression against real elapsed time
+# --------------------------------------------------------------------------- #
+
+
+def test_slope_is_per_time_unit_not_per_row(out_dir):
+    """Irregular spacing must not be flattened into row positions."""
+    # +2.0 per year, but the observations are unevenly spaced.
+    years = [2000, 2001, 2002, 2010, 2020]
+    df = pd.DataFrame({"year": years, "value": [2.0 * y for y in years]})
+
+    result = autolysis.run_time_series(df, out_dir)
+    assert not result.get("skipped")
+    assert result["slope"] == pytest.approx(2.0, abs=1e-6)
+    assert "per unit of year" in result["slope_unit"]
+
+
+def test_slope_handles_datetime_index(out_dir):
+    dates = pd.to_datetime(["2020-01-01", "2020-01-11", "2020-02-10"])
+    df = pd.DataFrame({"date": dates, "value": [0.0, 10.0, 40.0]})  # +1.0/day
+
+    result = autolysis.run_time_series(df, out_dir)
+    assert not result.get("skipped")
+    assert result["slope"] == pytest.approx(1.0, abs=1e-6)
+    assert result["slope_unit"] == "value per day"
+
+
+def test_string_dates_are_ordered_chronologically(out_dir):
+    """String dates must be coerced, not sorted lexicographically."""
+    df = pd.DataFrame(
+        {
+            "date": ["2020-01-02", "2020-01-10", "2020-01-01"],
+            "value": [1.0, 9.0, 0.0],
+        }
+    )
+    result = autolysis.run_time_series(df, out_dir)
+    assert not result.get("skipped")
+    assert result["direction"] == "increasing"
+    assert result["slope"] == pytest.approx(1.0, abs=1e-6)
 
 
 if __name__ == "__main__":

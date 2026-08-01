@@ -54,6 +54,7 @@ matplotlib.use("Agg")  # headless rendering — no display server required
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
 from sklearn.preprocessing import StandardScaler
 
 try:
@@ -92,6 +93,14 @@ CACHE_DIR = Path(".autolysis_cache")
 # than UTF-8; latin-1 is last because it decodes any byte sequence and so
 # always succeeds, making it the terminal fallback rather than a real guess.
 CSV_ENCODINGS = ("utf-8", "utf-8-sig", "cp1252", "latin-1")
+
+# Only these are worth a second attempt. A 400 (malformed request) or 404
+# (unknown model) is deterministic — retrying it four times with exponential
+# backoff just turns an instant failure into a slow one.
+RETRYABLE_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+
+MAX_CLUSTERS = 8          # widest k considered by the silhouette sweep
+SILHOUETTE_SAMPLE_CAP = 5000  # silhouette is O(n^2); cap the rows it scores
 
 log = logging.getLogger("autolysis")
 
@@ -218,21 +227,46 @@ class GeminiClient:
 
             except AuthenticationError:
                 raise
-            except (httpx.HTTPStatusError, httpx.TransportError, KeyError, ValueError) as exc:
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                if status not in RETRYABLE_STATUSES:
+                    raise AutolysisError(
+                        f"Gemini API rejected the request (HTTP {status}); not retryable: "
+                        f"{redact_secret(str(exc), self.api_key)}"
+                    ) from exc
                 last_exc = exc
-                if attempt == self.max_retries:
-                    break
-                log.debug(
-                    "Gemini call failed (attempt %d/%d): %s",
-                    attempt, self.max_retries, redact_secret(str(exc), self.api_key),
-                )
-                time.sleep(delay)
-                delay *= 2
+                # A server-supplied Retry-After outranks our own backoff guess.
+                wait = _retry_after_seconds(exc.response)
+                if wait is None:
+                    wait = delay
+            except (httpx.TransportError, KeyError, ValueError) as exc:
+                last_exc = exc
+                wait = delay
+
+            if attempt == self.max_retries:
+                break
+            log.debug(
+                "Gemini call failed (attempt %d/%d), retrying in %.1fs: %s",
+                attempt, self.max_retries, wait, redact_secret(str(last_exc), self.api_key),
+            )
+            time.sleep(wait)
+            delay *= 2
 
         raise AutolysisError(
             f"Gemini API call failed after {self.max_retries} attempts: "
             f"{redact_secret(str(last_exc), self.api_key)}"
         )
+
+
+def _retry_after_seconds(response: httpx.Response) -> float | None:
+    """Parse a Retry-After header, if the server sent one in delta-seconds form."""
+    raw = response.headers.get("Retry-After")
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return None  # HTTP-date form — fall back to our own backoff
 
 
 def _extract_text(data: dict) -> str:
@@ -274,8 +308,12 @@ def cached_generate(client: GeminiClient, prompt: str, *, json_mode: bool = Fals
 def profile_dataset(df: pd.DataFrame) -> dict:
     """Build a compact metadata bundle describing the dataset's structure.
 
-    Only aggregate statistics are included — no raw rows — so that the
-    payload sent to the LLM never contains individual data records.
+    Only aggregate statistics leave the machine. For categorical columns that
+    means cardinality and the shape of the frequency distribution, never the
+    values themselves: the top-5 values of a column can be names, emails or
+    diagnoses, and those are raw data however they are counted. Frequencies
+    alone carry the signal the router needs — is this column low-cardinality,
+    is it skewed — without the contents.
     """
     profile: dict[str, Any] = {
         "rows": len(df),
@@ -309,11 +347,12 @@ def profile_dataset(df: pd.DataFrame) -> dict:
                     "max": float(non_null.max()),
                 }
         else:
-            top_values = series.value_counts().head(5).to_dict()
+            counts = series.value_counts()
             profile["columns"][col] = {
                 "dtype": "object",
                 "null_pct": null_pct,
-                "top_values": {str(k): int(v) for k, v in top_values.items()},
+                "n_unique": int(series.nunique(dropna=True)),
+                "top_frequencies": [int(v) for v in counts.head(5)],
             }
 
     return profile
@@ -335,9 +374,10 @@ def build_routing_prompt(profile: dict, max_analyses: int = 3) -> str:
                 f"  - {col} [numeric]: mean={mean_s}, std={std_s}, nulls={stats['null_pct']:.1f}%"
             )
         else:
-            top_vals = ", ".join(f"{v}({c})" for v, c in stats["top_values"].items())
+            freqs = ", ".join(str(c) for c in stats["top_frequencies"])
             col_summaries.append(
-                f"  - {col} [categorical]: top={top_vals}, nulls={stats['null_pct']:.1f}%"
+                f"  - {col} [categorical]: {stats['n_unique']} distinct, "
+                f"top-5 counts=[{freqs}], nulls={stats['null_pct']:.1f}%"
             )
 
     cols_text = "\n".join(col_summaries)
@@ -479,47 +519,94 @@ def run_outliers(df: pd.DataFrame, out_dir: Path) -> dict:
     return {"outlier_counts": outlier_counts, "chart": str(chart_path)}
 
 
-def select_k_by_elbow(inertias: dict[int, float]) -> int:
-    """Select k via the elbow heuristic: the k after which marginal WCSS
-    reduction drops off most sharply relative to the previous step.
-    """
-    ks = sorted(inertias)
-    if len(ks) < 3:
-        return ks[0]
+def clustering_axis_scores(df: pd.DataFrame) -> pd.Series:
+    """Score numeric columns by how much cluster structure each one exposes.
 
-    drops = [inertias[ks[i]] - inertias[ks[i + 1]] for i in range(len(ks) - 1)]
-    scored = [(ks[i + 1], drops[i] - drops[i + 1]) for i in range(len(drops) - 1)]
-    best_k, _ = max(scored, key=lambda t: t[1])
-    return best_k
+    Ranking by raw variance makes the choice an artefact of units: a salary in
+    dollars will always outrank a rating in [0, 1] however much structure the
+    rating carries. Standardising first does not rescue a dispersion measure
+    either — every standardised column has variance 1 by construction, and two
+    gaussians of different widths are literally the same data once scaled, so
+    no dispersion statistic can (or should) separate them.
+
+    Excess kurtosis is scale-invariant *and* responds to what K-Means actually
+    wants. A bimodal column — two separated lumps — is strongly platykurtic; a
+    single gaussian sits near zero; an outlier-dominated column is leptokurtic
+    and makes a poor axis. Lower is better, so the score is negated to keep
+    "largest wins" semantics. Constant columns have undefined kurtosis and drop
+    out as NaN, which is correct: they carry no clustering signal at all.
+    """
+    scores: dict[str, float] = {}
+    for col in df.columns:
+        series = df[col].dropna()
+        if series.nunique() < 2:
+            scores[col] = np.nan
+            continue
+        kurtosis = series.kurt()  # NaN for fewer than 4 observations
+        scores[col] = np.nan if pd.isna(kurtosis) else -float(kurtosis)
+    return pd.Series(scores, dtype=float)
+
+
+def select_k_by_silhouette(
+    scaled: np.ndarray, k_values: range, random_state: int = 42
+) -> tuple[int, dict[int, float]]:
+    """Choose k by mean silhouette score, returning (best_k, all scores).
+
+    This replaces an elbow heuristic that scored second differences of inertia.
+    That construction could only ever nominate an *interior* k — with k drawn
+    from 2..5 it was structurally incapable of returning 2 or 5, so a genuinely
+    two-cluster dataset was unreachable. Silhouette is defined independently at
+    every k, so no candidate is excluded by the shape of the formula.
+
+    Scoring is capped at a sample of the rows because silhouette is O(n^2).
+    """
+    scores: dict[int, float] = {}
+    for k in k_values:
+        labels = KMeans(n_clusters=k, random_state=random_state, n_init="auto").fit_predict(scaled)
+        if len(set(labels)) < 2:  # degenerate fit; silhouette is undefined
+            continue
+        scores[k] = round(
+            float(
+                silhouette_score(
+                    scaled,
+                    labels,
+                    sample_size=min(len(scaled), SILHOUETTE_SAMPLE_CAP),
+                    random_state=random_state,
+                )
+            ),
+            4,
+        )
+
+    if not scores:
+        return min(k_values), {}
+    return max(scores, key=lambda k: scores[k]), scores
 
 
 def run_clustering(df: pd.DataFrame, out_dir: Path) -> dict:
-    """K-Means clustering on the two highest-variance numeric columns."""
-    numeric_cols = df.select_dtypes("number").dropna(axis=1).columns
-    if len(numeric_cols) < 2:
+    """K-Means clustering on the two most dispersed numeric columns."""
+    # Note: no dropna(axis=1) here. Discarding an entire column because one
+    # cell is missing throws away a candidate axis over a single NaN; the
+    # row-wise dropna below is enough, and the length guard catches pairs
+    # whose non-null rows barely overlap.
+    numeric_df = df.select_dtypes("number")
+    if numeric_df.shape[1] < 2:
         return {"skipped": True, "reason": "Fewer than 2 numeric columns"}
 
-    variances = df[numeric_cols].var().nlargest(2)
-    x_col, y_col = variances.index[0], variances.index[1]
-    data = df[[x_col, y_col]].dropna()
+    axis_scores = clustering_axis_scores(numeric_df).dropna()
+    if len(axis_scores) < 2:
+        return {"skipped": True, "reason": "Fewer than 2 non-constant numeric columns"}
+
+    x_col, y_col = axis_scores.nlargest(2).index
+    data = numeric_df[[x_col, y_col]].dropna()
 
     if len(data) < 10:
         return {"skipped": True, "reason": "Not enough rows for clustering"}
 
-    k_upper = min(5, len(data) - 1)
-    if k_upper < 3:
-        return {"skipped": True, "reason": "Not enough rows to evaluate multiple k values"}
-
     scaler = StandardScaler()
     scaled = scaler.fit_transform(data)
 
-    inertias: dict[int, float] = {}
-    for k in range(2, k_upper + 1):
-        km = KMeans(n_clusters=k, random_state=42, n_init="auto")
-        km.fit(scaled)
-        inertias[k] = float(km.inertia_)
-
-    best_k = select_k_by_elbow(inertias)
+    k_upper = min(MAX_CLUSTERS, len(data) - 1)
+    best_k, silhouettes = select_k_by_silhouette(scaled, range(2, k_upper + 1))
 
     km_final = KMeans(n_clusters=best_k, random_state=42, n_init="auto")
     labels = km_final.fit_predict(scaled)
@@ -540,7 +627,9 @@ def run_clustering(df: pd.DataFrame, out_dir: Path) -> dict:
 
     return {
         "k": best_k,
-        "inertia": round(inertias[best_k], 2),
+        "inertia": round(float(km_final.inertia_), 2),
+        "silhouette": silhouettes.get(best_k),
+        "silhouette_by_k": silhouettes,
         "x_col": x_col,
         "y_col": y_col,
         "cluster_means": cluster_means,
@@ -576,12 +665,32 @@ def run_time_series(df: pd.DataFrame, out_dir: Path) -> dict:
     target_col = df[numeric_cols].var().idxmax()
     plot_df = df[[time_col, target_col]].dropna()
 
+    # A date column held as strings would otherwise sort lexicographically and
+    # be spaced by row position, so coerce it to real timestamps first.
+    if not (
+        pd.api.types.is_numeric_dtype(plot_df[time_col])
+        or pd.api.types.is_datetime64_any_dtype(plot_df[time_col])
+    ):
+        plot_df = plot_df.assign(**{time_col: pd.to_datetime(plot_df[time_col], errors="coerce")})
+        plot_df = plot_df.dropna(subset=[time_col])
+
     if plot_df[time_col].nunique() < 2:
         return {"skipped": True, "reason": "Insufficient distinct time points"}
 
     grouped = plot_df.groupby(time_col)[target_col].mean().sort_index()
-    x = np.arange(len(grouped))
-    y = grouped.to_numpy()
+    y = grouped.to_numpy(dtype=float)
+
+    # Regress against real elapsed time, not row position. Using arange() makes
+    # 2000, 2001, 2020 evenly spaced and yields a slope "per observed point",
+    # which is unitless and wrong whenever the series is irregular.
+    index = grouped.index
+    if pd.api.types.is_datetime64_any_dtype(index):
+        x = (index - index[0]).total_seconds().to_numpy(dtype=float) / 86400.0
+        slope_unit = f"{target_col} per day"
+    else:
+        x = index.to_numpy(dtype=float)
+        slope_unit = f"{target_col} per unit of {time_col}"
+
     slope, intercept = np.polyfit(x, y, 1)
     trend = slope * x + intercept
 
@@ -600,6 +709,7 @@ def run_time_series(df: pd.DataFrame, out_dir: Path) -> dict:
         "time_col": time_col,
         "target_col": target_col,
         "slope": round(float(slope), 4),
+        "slope_unit": slope_unit,
         "direction": "increasing" if slope > 0 else "decreasing" if slope < 0 else "flat",
         "chart": str(chart_path),
     }
@@ -665,7 +775,10 @@ def build_narrative_prompt(profile: dict, results: dict[str, dict], dataset_name
                 f"nulls={stats['null_pct']:.1f}%"
             )
         else:
-            lines.append(f"  - {col} [categorical]: nulls={stats['null_pct']:.1f}%")
+            lines.append(
+                f"  - {col} [categorical]: {stats['n_unique']} distinct, "
+                f"nulls={stats['null_pct']:.1f}%"
+            )
 
     lines.append("\nAnalysis results:")
     for name, result in results.items():

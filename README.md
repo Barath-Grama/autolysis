@@ -3,10 +3,12 @@
 **Autolysis** is an intelligent, fully automated CSV analysis engine. Point it at a
 CSV file and it will:
 
-1. **Profile** the dataset (dtypes, null ratios, summary stats / top categories).
+1. **Profile** the dataset (dtypes, null ratios, summary stats, categorical
+   cardinality and frequency shape).
 2. Ask **Gemini** which of five supported analyses are most appropriate for the data.
-3. Run those analyses **locally** with pandas / scikit-learn / matplotlib — no raw
-   data rows ever leave your machine, only aggregate statistics.
+3. Run those analyses **locally** with pandas / scikit-learn / matplotlib. What
+   leaves your machine is column *names* and aggregate statistics — never cell
+   values, not even the most frequent ones (see [What gets sent](#what-gets-sent)).
 4. Ask Gemini a second time to **narrate** the numeric findings into a polished,
    chart-embedded `README.md`.
 
@@ -93,8 +95,8 @@ often produce meaningless charts on the wrong dataset shape:
 |-----------------------|---------------------------------------------------------------------|
 | `correlation`          | Pearson correlation matrix → heatmap                               |
 | `outliers`             | IQR (Tukey fence) outlier detection → z-scored box plot             |
-| `clustering`            | K-Means on the two highest-variance numeric columns, k chosen via elbow method → scatter plot |
-| `time_series`           | Heuristic time-column detection + OLS trend line                    |
+| `clustering`            | K-Means on the two most cluster-structured numeric columns (ranked by scale-invariant excess kurtosis), k ∈ [2, 8] chosen by silhouette score → scatter plot |
+| `time_series`           | Heuristic time-column detection + OLS trend against real elapsed time |
 | `category_analysis`     | Top-N frequency bar chart for the richest categorical column        |
 
 Every routine degrades gracefully — e.g. clustering is skipped with a clear
@@ -128,7 +130,7 @@ pip install -r requirements.txt
 pytest tests/ -v
 ```
 
-All 36 tests mock the Gemini API (`unittest.mock`), so the suite runs fully
+All 56 tests mock the Gemini API (`unittest.mock`), so the suite runs fully
 offline and deterministically. Coverage includes:
 
 - IQR outlier boundary correctness (equivalence partitioning at the Tukey fence)
@@ -144,15 +146,33 @@ offline and deterministically. Coverage includes:
 - CSV encoding fallback: latin-1/cp1252 input is decoded rather than crashing,
   UTF-8 still takes precedence, malformed CSVs raise a clean error
 - `--max-analyses` propagating from the CLI into the routing prompt itself
+- Clustering axis selection being scale-free: rescaling a column's units must
+  not reshuffle the ranking, and structured columns must outrank plain noise
+- Silhouette k-selection recovering 2, 3 and 5 clusters from known blobs —
+  including the endpoints the previous elbow heuristic could never return
+- No cell value from a PII-shaped frame appearing in either prompt
+- Retry policy: 400/404/422 failing on the first attempt, 429/5xx retrying,
+  `Retry-After` overriding local backoff, 403 short-circuiting to auth failure
+- Trend slopes measured per time unit, over irregular spacing, datetime
+  indices, and string dates that must not sort lexicographically
 
 ## Architecture notes
 
-- **Two LLM calls, not more.** Call #1 sends only column-level metadata
-  (dtypes, null %, five-number summaries / top-5 categories) — never raw
-  rows — and gets back a JSON array of analysis identifiers drawn from a
-  closed vocabulary, so a non-compliant response can never trigger an
-  unsupported routine. Call #2 sends the computed numeric results and chart
-  filenames and gets back the final Markdown narrative.
+- **Two LLM calls, not more.** Call #1 sends only column-level metadata and
+  gets back a JSON array of analysis identifiers drawn from a closed
+  vocabulary, so a non-compliant response can never trigger an unsupported
+  routine. Call #2 sends the computed numeric results and chart filenames and
+  gets back the final Markdown narrative.
+
+<a name="what-gets-sent"></a>
+- **What gets sent.** Column names, dtypes, null percentages, numeric
+  five-number summaries, and for categorical columns the distinct count plus
+  the top-5 *frequencies* — `[12, 9, 8, 8, 7]`, not the labels they belong to.
+  Sending the top-5 values themselves would mean shipping names, emails or
+  diagnoses to a third party under the banner of "aggregate statistics"; the
+  counts carry the signal the router needs (is this low-cardinality, is it
+  skewed) without the contents. Three tests assert that no cell value from the
+  sample data appears in either prompt.
 - **Sequential execution.** Analysis routines run one after another rather
   than concurrently: each is dominated by already-parallelized pandas/
   scikit-learn internals, and charts must exist on disk before the
@@ -160,6 +180,25 @@ offline and deterministically. Coverage includes:
 - **Resilience beyond the original design.** Gemini calls retry with
   exponential backoff; if the narrative call still fails, Autolysis falls
   back to a deterministic templated report rather than crashing.
+- **Scale-invariant clustering axes.** Picking the two *highest-variance*
+  columns picks by unit — salaries in dollars always beat ratings in [0, 1] —
+  and standardising first doesn't rescue it, since every standardised column
+  has variance 1 by construction. Excess kurtosis is scale-invariant and
+  responds to what K-Means wants: bimodal columns are platykurtic, plain
+  gaussians sit near zero, outlier-dominated columns are leptokurtic.
+- **Silhouette over elbow for k.** The elbow heuristic scored second
+  differences of inertia, which can only ever nominate an *interior* k — with
+  k drawn from 2..5 it was structurally incapable of returning 2 or 5. The
+  silhouette score is defined independently at every k, so no candidate is
+  excluded by the shape of the formula. Scoring is row-capped because
+  silhouette is O(n²).
+- **Trends regress against elapsed time.** Fitting against row position makes
+  2000, 2001 and 2020 evenly spaced and yields a slope "per observed point"
+  that carries no unit. Slopes are now per year / per day, and reported with
+  the unit attached.
+- **Retries only where retrying can help.** 408/429/5xx back off exponentially
+  and honour `Retry-After`; a 400 or 404 is deterministic and fails
+  immediately rather than four times more slowly.
 - **Secret handling.** The API key travels in the `x-goog-api-key` header, not
   a URL query parameter — httpx embeds the full request URL in its exception
   messages, so a query-string key leaks into every retry log line and error
