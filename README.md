@@ -46,19 +46,21 @@ python autolysis.py sample_data/goodreads.csv
 
 ### Without an API key
 
-Autolysis can also run entirely offline (no Gemini calls at all), using a
-default analysis set and a deterministic templated report — handy for demos,
-CI, or environments without network access:
+Autolysis can also run entirely offline (no Gemini calls at all). Analyses are
+chosen from the dataset's own shape rather than by the model, and the report
+comes from a deterministic template — handy for demos, CI, or air-gapped
+environments. All five routines are reachable this way:
 
 ```bash
-python autolysis.py sample_data/happiness.csv --offline
+python autolysis.py sample_data/happiness.csv --offline --max-analyses 5
 ```
 
 ## CLI reference
 
 ```
 usage: autolysis [-h] [-o OUTPUT_DIR] [-m MODEL] [--max-analyses MAX_ANALYSES]
-                  [--offline] [--cache] [--html] [-v]
+                  [--top-categories TOP_CATEGORIES] [--offline] [--cache]
+                  [--html] [-v]
                   csv_path
 
 positional arguments:
@@ -68,10 +70,13 @@ options:
   -o, --output-dir      Output directory (default: ./<csv-stem>_output)
   -m, --model           Gemini model to use (default: env GEMINI_MODEL or
                          'gemini-2.5-flash-lite')
-  --max-analyses N      Maximum number of analyses the LLM may select (default: 3)
-  --offline             Skip all LLM calls; run default analyses + templated report
+  --max-analyses N      Maximum number of analyses to run (default: 3)
+  --top-categories N    Bars in the category frequency chart (default: 8)
+  --offline             Skip all LLM calls; choose analyses from the data shape
+                         and write a templated report
   --cache               Cache LLM responses on disk (.autolysis_cache/) to avoid
-                         repeat API calls during development
+                         repeat API calls during development; entries expire
+                         after 7 days
   --html                Additionally render report.html alongside README.md
   -v, --verbose          Enable debug logging
 ```
@@ -82,8 +87,11 @@ options:
 |---------------------------------|---------------------------------------------|
 | `GEMINI_API_KEY` / `GOOGLE_API_KEY` | Gemini API key (required unless `--offline`) |
 | `GEMINI_MODEL`                  | Overrides the default model (`gemini-2.5-flash-lite`) |
+| `AUTOLYSIS_CACHE_DIR`           | Where `--cache` writes (default `./.autolysis_cache`) |
 
-See `.env.example`.
+A `.env` file in the working directory is loaded automatically; real
+environment variables always take precedence over it. Copy `.env.example` to
+`.env` to get started.
 
 ## Supported analyses
 
@@ -130,7 +138,7 @@ pip install -r requirements.txt
 pytest tests/ -v
 ```
 
-All 56 tests mock the Gemini API (`unittest.mock`), so the suite runs fully
+All 94 tests mock the Gemini API (`unittest.mock`), so the suite runs fully
 offline and deterministically. Coverage includes:
 
 - IQR outlier boundary correctness (equivalence partitioning at the Tukey fence)
@@ -155,6 +163,14 @@ offline and deterministically. Coverage includes:
   `Retry-After` overriding local backoff, 403 short-circuiting to auth failure
 - Trend slopes measured per time unit, over irregular spacing, datetime
   indices, and string dates that must not sort lexicographically
+- HTML sanitisation: `<script>`, `<iframe>`, `onerror=`, `javascript:` URLs and
+  inline `style` stripped, while headings, tables, code and relative chart
+  `<img>` links survive
+- Cache behaviour: hit/miss, TTL expiry, and `json_mode` producing a distinct
+  key rather than colliding with the plain-text entry
+- `.env` loading, including a real environment variable winning over the file
+- Offline selection reaching `time_series` and `category_analysis`, and
+  degrading to a single routine on a one-column frame
 
 ## Architecture notes
 
@@ -210,8 +226,25 @@ offline and deterministically. Coverage includes:
   file into an uncaught traceback.
 - **`--offline` mode** runs the full local pipeline (profiling → analysis →
   chart rendering → templated report) with zero network calls, useful for
-  CI, air-gapped environments, or quick demos.
+  CI, air-gapped environments, or quick demos. Analyses are picked from the
+  data's shape — numeric arity, a detected time column, categorical
+  cardinality — so every routine is reachable and testable without a key.
+  The same selector is the fallback when a routing call fails.
 - **`--cache`** memoizes LLM responses on disk so repeated runs against the
-  same dataset during development don't re-incur API cost/latency.
-- **`--html`** renders `report.html` from the generated Markdown for easy
-  sharing outside of a Markdown viewer.
+  same dataset during development don't re-incur API cost/latency. Entries
+  key on model, prompt *and* response format, and expire after a week so a
+  long-lived cache can't pin the pipeline to an answer from a model that has
+  since changed.
+- **`--html`** renders `report.html` from the generated Markdown. The
+  narrative is model-generated and the file is meant to be shared, so the
+  rendered markup goes through an allowlist sanitiser — python-markdown
+  passes raw HTML straight through, and a report containing `<script>` would
+  otherwise execute in whoever opens it. Tags whose content is code rather
+  than prose are dropped wholesale, not merely unwrapped.
+- **Deterministic routing, varied prose.** The routing call runs at
+  temperature 0 — it is closed-vocabulary classification, and the same
+  dataset should route the same way twice. The narrative call keeps 0.4.
+- **Statistics use every row; only rendering samples.** Outlier counts and
+  correlations are computed on the full frame. Plots and the O(n²) silhouette
+  fit draw a capped, seeded sample, because a boxplot of five million points
+  is illegible as well as slow.

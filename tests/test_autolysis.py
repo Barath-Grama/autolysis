@@ -16,7 +16,9 @@ to run this suite.
 from __future__ import annotations
 
 import json
+import os
 import sys
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -374,15 +376,11 @@ def test_no_categorical_columns_skipped(out_dir):
 
 def test_gemini_client_retries_then_raises_autolysis_error():
     client = autolysis.GeminiClient(api_key="fake", max_retries=2, base_delay=0.01)
-    with patch("httpx.Client") as mock_client_cls:
-        mock_client = MagicMock()
-        mock_client.__enter__.return_value = mock_client
-        mock_client.post.side_effect = Exception("boom")
-        mock_client_cls.return_value = mock_client
-        # Force a transport-style error via patching post to raise httpx.TransportError
-        import httpx as httpx_mod
+    mock_client = MagicMock()
+    mock_client.__enter__.return_value = mock_client
+    mock_client.post.side_effect = httpx.TransportError("network down")
 
-        mock_client.post.side_effect = httpx_mod.TransportError("network down")
+    with patch("httpx.Client", return_value=mock_client):
         with pytest.raises(autolysis.AutolysisError):
             client.generate("hello")
 
@@ -696,6 +694,303 @@ def test_string_dates_are_ordered_chronologically(out_dir):
     assert not result.get("skipped")
     assert result["direction"] == "increasing"
     assert result["slope"] == pytest.approx(1.0, abs=1e-6)
+
+
+# --------------------------------------------------------------------------- #
+# HTML export: no-op path, and sanitisation of model-generated markup
+# --------------------------------------------------------------------------- #
+
+
+def test_export_html_writes_report_next_to_readme(tmp_path):
+    readme = tmp_path / "README.md"
+    readme.write_text("# Title\n\n| a | b |\n|---|---|\n| 1 | 2 |\n", encoding="utf-8")
+
+    html_path = autolysis.export_html(readme)
+    assert html_path == tmp_path / "report.html"
+    body = html_path.read_text(encoding="utf-8")
+    assert "<h1>Title</h1>" in body
+    assert "<table>" in body  # the tables extension is actually wired up
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "<script>alert(1)</script>",
+        "<img src=x onerror=alert(1)>",
+        '<a href="javascript:alert(1)">click</a>',
+        "<iframe src='https://evil.example'></iframe>",
+        "<object data='x'></object>",
+        "<svg/onload=alert(1)>",
+        '<div style="position:fixed;top:0">overlay</div>',
+    ],
+)
+def test_sanitizer_strips_active_content(payload):
+    """The narrative is model-generated and often shared; it must not execute."""
+    out = autolysis.sanitize_html(payload).lower()
+    for banned in ("<script", "<iframe", "<object", "<svg", "onerror", "onload", "javascript:", "style="):
+        assert banned not in out
+
+
+def test_sanitizer_keeps_report_markup():
+    """Sanitising must not gut the actual report."""
+    markup = (
+        '<h2>Findings</h2><p><strong>r</strong> = 0.36</p>'
+        '<img src="correlation_heatmap.png" alt="correlation">'
+        '<a href="https://example.com" title="src">source</a>'
+        "<table><tr><td>1</td></tr></table><pre><code>x = 1</code></pre>"
+    )
+    out = autolysis.sanitize_html(markup)
+    assert "<h2>Findings</h2>" in out
+    assert "<strong>r</strong>" in out
+    assert 'src="correlation_heatmap.png"' in out  # relative chart links survive
+    assert 'href="https://example.com"' in out
+    assert "<table>" in out and "<code>" in out
+
+
+def test_export_html_sanitizes_end_to_end(tmp_path):
+    readme = tmp_path / "README.md"
+    readme.write_text("# Report\n\n<script>alert('xss')</script>\n\nText.\n", encoding="utf-8")
+
+    body = autolysis.export_html(readme).read_text(encoding="utf-8")
+    assert "<script>" not in body
+    assert "alert" not in body  # the script *body* is dropped, not just the tag
+    assert "<h1>Report</h1>" in body and "<p>Text.</p>" in body
+
+
+def test_export_html_returns_none_without_markdown(tmp_path, monkeypatch):
+    readme = tmp_path / "README.md"
+    readme.write_text("# Title\n", encoding="utf-8")
+    monkeypatch.setattr(autolysis, "_HAS_MARKDOWN", False)
+    assert autolysis.export_html(readme) is None
+
+
+# --------------------------------------------------------------------------- #
+# Response cache
+# --------------------------------------------------------------------------- #
+
+
+def _client_returning(text: str):
+    client = autolysis.GeminiClient(api_key="k")
+    client.generate = MagicMock(return_value=text)
+    return client
+
+
+def test_cache_disabled_by_default_calls_through(tmp_path):
+    client = _client_returning("fresh")
+    assert autolysis.cached_generate(client, "p", cache_dir=tmp_path) == "fresh"
+    assert autolysis.cached_generate(client, "p", cache_dir=tmp_path) == "fresh"
+    assert client.generate.call_count == 2
+
+
+def test_cache_hit_avoids_second_call(tmp_path):
+    client = _client_returning("once")
+    autolysis.cached_generate(client, "p", use_cache=True, cache_dir=tmp_path)
+    autolysis.cached_generate(client, "p", use_cache=True, cache_dir=tmp_path)
+    assert client.generate.call_count == 1
+
+
+def test_cache_separates_json_mode(tmp_path):
+    """json_mode changes the response format, so it must change the key."""
+    client = _client_returning("x")
+    autolysis.cached_generate(client, "p", json_mode=True, use_cache=True, cache_dir=tmp_path)
+    autolysis.cached_generate(client, "p", json_mode=False, use_cache=True, cache_dir=tmp_path)
+    assert client.generate.call_count == 2
+    assert autolysis._cache_key("p", "m", True) != autolysis._cache_key("p", "m", False)
+
+
+def test_cache_entry_expires(tmp_path):
+    client = _client_returning("stale")
+    autolysis.cached_generate(client, "p", use_cache=True, cache_dir=tmp_path)
+
+    entry = next(tmp_path.glob("*.txt"))
+    old = time.time() - (autolysis.CACHE_TTL_SECONDS + 60)
+    os.utime(entry, (old, old))
+
+    autolysis.cached_generate(client, "p", use_cache=True, cache_dir=tmp_path)
+    assert client.generate.call_count == 2
+
+
+def test_cache_dir_is_created_on_demand(tmp_path):
+    nested = tmp_path / "deep" / "cache"
+    autolysis.cached_generate(_client_returning("v"), "p", use_cache=True, cache_dir=nested)
+    assert nested.is_dir()
+
+
+# --------------------------------------------------------------------------- #
+# Profiler and time-column heuristic
+# --------------------------------------------------------------------------- #
+
+
+def test_profile_reports_shape_and_nulls():
+    df = pd.DataFrame({"n": [1.0, 2.0, None, 4.0], "c": ["a", "a", "b", None]})
+    profile = autolysis.profile_dataset(df)
+    assert profile["rows"] == 4 and profile["cols"] == 2
+    assert profile["columns"]["n"]["null_pct"] == pytest.approx(25.0)
+    assert profile["columns"]["n"]["mean"] == pytest.approx(7 / 3)
+    assert profile["columns"]["c"]["n_unique"] == 2
+
+
+def test_profile_handles_all_null_numeric_column():
+    # dtype must be forced: [None, None] infers as object, which would take the
+    # categorical branch and never exercise the all-null numeric path.
+    df = pd.DataFrame({"empty": pd.Series([None, None], dtype="float64")})
+    profile = autolysis.profile_dataset(df)
+    assert profile["columns"]["empty"]["mean"] is None
+    assert profile["columns"]["empty"]["null_pct"] == pytest.approx(100.0)
+
+
+def test_profile_counts_duplicate_rows():
+    df = pd.DataFrame({"a": [1, 1, 2], "b": ["x", "x", "y"]})
+    assert autolysis.profile_dataset(df)["duplicate_rows"] == 1
+
+
+@pytest.mark.parametrize("column", ["year", "date", "Order Date", "month", "quarter"])
+def test_find_time_column_matches_keywords(column):
+    df = pd.DataFrame({column: range(2000, 2010), "value": range(10)})
+    assert autolysis.find_time_column(df) == column
+
+
+def test_find_time_column_returns_none_without_temporal_data():
+    assert autolysis.find_time_column(pd.DataFrame({"a": range(5), "b": range(5)})) is None
+
+
+def test_find_time_column_accepts_string_dates():
+    df = pd.DataFrame({"date": ["2020-01-01", "2020-02-01"], "v": [1, 2]})
+    assert autolysis.find_time_column(df) == "date"
+
+
+# --------------------------------------------------------------------------- #
+# Offline analysis selection, .env loading, sampling, config plumbing
+# --------------------------------------------------------------------------- #
+
+
+def test_offline_selection_reaches_beyond_correlation_and_outliers():
+    """--offline used to hardcode two routines, leaving three unreachable."""
+    rng = np.random.default_rng(1)
+    df = pd.DataFrame(
+        {
+            "year": list(range(2000, 2060)),
+            "value": rng.normal(0, 1, 60),
+            "category": rng.choice(["a", "b", "c"], 60),
+        }
+    )
+    selected = autolysis.select_default_analyses(df, max_analyses=5)
+    assert "time_series" in selected
+    assert "category_analysis" in selected
+    assert len(selected) <= 5
+
+
+def test_offline_selection_respects_max_analyses():
+    df = pd.DataFrame({"a": range(20), "b": range(20, 40)})
+    assert len(autolysis.select_default_analyses(df, max_analyses=1)) == 1
+
+
+def test_offline_selection_degrades_on_a_single_column():
+    df = pd.DataFrame({"only": range(20)})
+    assert autolysis.select_default_analyses(df) == ["outliers"]
+
+
+def test_offline_pipeline_runs_more_than_two_analyses(tmp_path):
+    rng = np.random.default_rng(2)
+    csv_path = tmp_path / "wide.csv"
+    pd.DataFrame(
+        {
+            "year": list(range(2000, 2060)),
+            "value": rng.normal(0, 1, 60),
+            "category": rng.choice(["a", "b", "c"], 60),
+        }
+    ).to_csv(csv_path, index=False)
+
+    config = autolysis.Config(api_key="", offline=True, max_analyses=5, output_dir=tmp_path / "out")
+    out_dir = autolysis.run_pipeline(csv_path, config)
+    charts = {p.name for p in out_dir.glob("*.png")}
+    assert len(charts) >= 3
+
+
+def test_load_dotenv_populates_missing_keys(tmp_path, monkeypatch):
+    env = tmp_path / ".env"
+    env.write_text(
+        "# comment\n\nGEMINI_API_KEY=from-dotenv\nexport GEMINI_MODEL='quoted-model'\nBROKEN\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_MODEL", raising=False)
+
+    autolysis.load_dotenv(env)
+    assert os.environ["GEMINI_API_KEY"] == "from-dotenv"
+    assert os.environ["GEMINI_MODEL"] == "quoted-model"
+
+
+def test_load_dotenv_never_overrides_a_real_env_var(tmp_path, monkeypatch):
+    env = tmp_path / ".env"
+    env.write_text("GEMINI_API_KEY=from-dotenv\n", encoding="utf-8")
+    monkeypatch.setenv("GEMINI_API_KEY", "from-shell")
+
+    autolysis.load_dotenv(env)
+    assert os.environ["GEMINI_API_KEY"] == "from-shell"
+
+
+def test_load_dotenv_is_a_noop_when_absent(tmp_path):
+    autolysis.load_dotenv(tmp_path / "nope.env")  # must not raise
+
+
+def test_sample_for_plot_caps_rows_and_is_deterministic():
+    df = pd.DataFrame({"x": range(100)})
+    first = autolysis.sample_for_plot(df, cap=10)
+    assert len(first) == 10
+    assert first.equals(autolysis.sample_for_plot(df, cap=10))
+    assert autolysis.sample_for_plot(df, cap=500) is df  # no copy when under cap
+
+
+def test_top_categories_flag_reaches_the_chart(tmp_path):
+    rng = np.random.default_rng(5)
+    csv_path = tmp_path / "cats.csv"
+    pd.DataFrame(
+        {"label": rng.choice([f"c{i}" for i in range(12)], 200), "v": rng.normal(0, 1, 200)}
+    ).to_csv(csv_path, index=False)
+
+    args = autolysis.build_arg_parser().parse_args(
+        [str(csv_path), "--offline", "--top-categories", "3", "-o", str(tmp_path / "out")]
+    )
+    config = autolysis.load_config(args)
+    assert config.top_n_categories == 3
+
+    result = autolysis.run_category_analysis(
+        pd.read_csv(csv_path), tmp_path, top_n=config.top_n_categories
+    )
+    assert len(result["top_categories"]) == 3
+
+
+def test_load_config_resolves_output_dir_from_csv_stem(tmp_path):
+    args = autolysis.build_arg_parser().parse_args([str(tmp_path / "sales.csv"), "--offline"])
+    assert autolysis.load_config(args).output_dir == Path("sales_output")
+
+
+def test_routing_uses_temperature_zero(tmp_path, synthetic_df):
+    """Closed-vocabulary routing should be reproducible; prose need not be."""
+    csv_path = tmp_path / "s.csv"
+    synthetic_df.to_csv(csv_path, index=False)
+
+    with patch.object(autolysis.GeminiClient, "generate") as mock_generate:
+        mock_generate.side_effect = ['["correlation"]', "# R\n\ntext."]
+        autolysis.run_pipeline(
+            csv_path, autolysis.Config(api_key="k", output_dir=tmp_path / "out")
+        )
+
+    assert mock_generate.call_args_list[0].kwargs["temperature"] == 0.0
+    assert mock_generate.call_args_list[1].kwargs["temperature"] == pytest.approx(0.4)
+
+
+def test_extract_text_error_does_not_dump_the_body():
+    """A failed parse must not echo an entire API response into the logs."""
+    payload = {"promptFeedback": {"blockReason": "SAFETY"}, "junk": "x" * 5000}
+    with pytest.raises(autolysis.AutolysisError) as excinfo:
+        autolysis._extract_text(payload)
+
+    message = str(excinfo.value)
+    assert len(message) < 200
+    assert "x" * 100 not in message
+    assert "promptFeedback" in message  # the shape is still diagnosable
 
 
 if __name__ == "__main__":

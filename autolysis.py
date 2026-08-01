@@ -2,14 +2,14 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#   "pandas>=2.2",
-#   "numpy>=1.26",
-#   "scikit-learn>=1.4",
-#   "matplotlib>=3.8",
-#   "seaborn>=0.13",
-#   "httpx>=0.27",
-#   "rich>=13.7",
-#   "markdown>=3.6",
+#   "pandas>=2.2,<4",
+#   "numpy>=1.26,<3",
+#   "scikit-learn>=1.4,<2",
+#   "matplotlib>=3.8,<3.13",
+#   "seaborn>=0.13,<0.15",
+#   "httpx>=0.27,<1",
+#   "rich>=13.7,<16",
+#   "markdown>=3.6,<4",
 # ]
 # ///
 """
@@ -34,13 +34,15 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import json
 import logging
 import os
 import re
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Callable
 
@@ -102,6 +104,20 @@ RETRYABLE_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
 MAX_CLUSTERS = 8          # widest k considered by the silhouette sweep
 SILHOUETTE_SAMPLE_CAP = 5000  # silhouette is O(n^2); cap the rows it scores
 
+# Statistics are always computed on every row. This cap applies only to the
+# rows handed to a renderer or an O(n^2) fit: a boxplot of five million points
+# is illegible as well as slow, so plotting a representative sample costs
+# nothing in fidelity and bounds runtime on large inputs.
+MAX_PLOT_ROWS = 20_000
+PLOT_SAMPLE_SEED = 42
+
+CACHE_TTL_SECONDS = 7 * 24 * 3600  # a week; prompts and models both drift
+
+# Routing is a closed-vocabulary classification: temperature 0 makes the same
+# dataset route the same way twice. Narrative prose keeps a little variety.
+ROUTING_TEMPERATURE = 0.0
+NARRATIVE_TEMPERATURE = 0.4
+
 log = logging.getLogger("autolysis")
 
 
@@ -130,13 +146,44 @@ def redact_secret(text: str, secret: str) -> str:
 # --------------------------------------------------------------------------- #
 
 
+def load_dotenv(path: Path | None = None) -> None:
+    """Populate os.environ from a .env file, without overriding real env vars.
+
+    Shipping a .env.example while nothing reads .env makes the template a
+    trap. This is deliberately a dozen lines rather than a python-dotenv
+    dependency: the file format in play here is KEY=value plus comments.
+    """
+    env_path = path or Path(".env")
+    if not env_path.is_file():
+        return
+
+    try:
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:  # unreadable .env should never be fatal
+        log.debug("Could not read %s: %s", env_path, exc)
+        return
+
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip().removeprefix("export ").strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:  # a real env var always wins
+            os.environ[key] = value
+
+
 @dataclass
 class Config:
     api_key: str
     model: str = DEFAULT_MODEL
     max_analyses: int = 3
     top_n_categories: int = 8
-    output_dir: Path = Path("output")
+    # Applies when Config is built directly (tests, library use). The CLI path
+    # always resolves a concrete directory in load_config().
+    output_dir: Path = field(default_factory=lambda: Path("output"))
+    cache_dir: Path = field(default_factory=lambda: Path(".autolysis_cache"))
     offline: bool = False
     use_cache: bool = False
     html: bool = False
@@ -145,12 +192,15 @@ class Config:
 
 def load_config(args: argparse.Namespace) -> Config:
     """Resolve configuration from CLI args and environment variables."""
+    load_dotenv()
+
     api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or ""
 
     if not api_key and not args.offline:
         raise AuthenticationError(
             "No Gemini API key found. Set the GEMINI_API_KEY or GOOGLE_API_KEY "
-            "environment variable, or re-run with --offline to skip LLM calls."
+            "environment variable (a .env file works too), or re-run with "
+            "--offline to skip LLM calls."
         )
 
     model = args.model or os.environ.get("GEMINI_MODEL", DEFAULT_MODEL)
@@ -159,6 +209,11 @@ def load_config(args: argparse.Namespace) -> Config:
         api_key=api_key,
         model=model,
         max_analyses=args.max_analyses,
+        top_n_categories=args.top_categories,
+        # Resolved here rather than patched onto the object afterwards, so a
+        # Config is complete the moment it is constructed.
+        output_dir=args.output_dir or Path(f"{args.csv_path.stem}_output"),
+        cache_dir=Path(os.environ.get("AUTOLYSIS_CACHE_DIR", ".autolysis_cache")),
         offline=args.offline,
         use_cache=args.cache,
         html=args.html,
@@ -193,14 +248,16 @@ class GeminiClient:
         self.timeout = timeout
         self.base_delay = base_delay
 
-    def generate(self, prompt: str, *, json_mode: bool = False) -> str:
+    def generate(
+        self, prompt: str, *, json_mode: bool = False, temperature: float = NARRATIVE_TEMPERATURE
+    ) -> str:
         """Send a single-turn prompt to Gemini and return the text response."""
         # The key travels in a header, never the URL: httpx embeds the full URL
         # in its exception messages, so a query-string key would leak into every
         # retry log line and error report.
         url = f"{GEMINI_BASE_URL}/{self.model}:generateContent"
         headers = {"x-goog-api-key": self.api_key}
-        generation_config: dict[str, Any] = {"temperature": 0.4}
+        generation_config: dict[str, Any] = {"temperature": temperature}
         if json_mode:
             generation_config["responseMimeType"] = "application/json"
 
@@ -273,29 +330,52 @@ def _extract_text(data: dict) -> str:
     try:
         return data["candidates"][0]["content"]["parts"][0]["text"]
     except (KeyError, IndexError, TypeError) as exc:
-        raise AutolysisError(f"Unexpected Gemini response shape: {data}") from exc
+        # Summarise rather than dump: the body can be megabytes, and echoing a
+        # whole API response into a log is how prompts and content end up in
+        # places nobody expects.
+        shape = ", ".join(sorted(data)) if isinstance(data, dict) else type(data).__name__
+        raise AutolysisError(
+            f"Unexpected Gemini response shape (top-level keys: {shape})"
+        ) from exc
 
 
-def _cache_key(prompt: str, model: str) -> str:
-    return hashlib.sha256(f"{model}:{prompt}".encode("utf-8")).hexdigest()
+def _cache_key(prompt: str, model: str, json_mode: bool = False) -> str:
+    # json_mode changes the response format, so it has to be part of the
+    # identity of the entry or the two modes collide on one file.
+    return hashlib.sha256(f"{model}:{int(json_mode)}:{prompt}".encode("utf-8")).hexdigest()
 
 
-def cached_generate(client: GeminiClient, prompt: str, *, json_mode: bool = False, use_cache: bool = False) -> str:
+def cached_generate(
+    client: GeminiClient,
+    prompt: str,
+    *,
+    json_mode: bool = False,
+    use_cache: bool = False,
+    cache_dir: Path | None = None,
+    temperature: float = NARRATIVE_TEMPERATURE,
+) -> str:
     """Call the Gemini client, transparently caching responses to disk when enabled.
 
     Caching avoids repeated API costs/latency when iterating on the same
-    dataset during development (e.g. tweaking chart styling).
+    dataset during development (e.g. tweaking chart styling). Entries expire
+    after CACHE_TTL_SECONDS so a long-lived cache cannot pin the pipeline to a
+    stale answer from a model that has since changed.
     """
     if not use_cache:
-        return client.generate(prompt, json_mode=json_mode)
+        return client.generate(prompt, json_mode=json_mode, temperature=temperature)
 
-    CACHE_DIR.mkdir(exist_ok=True)
-    cache_file = CACHE_DIR / f"{_cache_key(prompt, client.model)}.txt"
+    cache_dir = cache_dir or CACHE_DIR
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_file = cache_dir / f"{_cache_key(prompt, client.model, json_mode)}.txt"
+
     if cache_file.exists():
-        log.debug("Cache hit: %s", cache_file.name)
-        return cache_file.read_text(encoding="utf-8")
+        age = time.time() - cache_file.stat().st_mtime
+        if age < CACHE_TTL_SECONDS:
+            log.debug("Cache hit: %s", cache_file.name)
+            return cache_file.read_text(encoding="utf-8")
+        log.debug("Cache entry %s expired (%.1f h old)", cache_file.name, age / 3600)
 
-    result = client.generate(prompt, json_mode=json_mode)
+    result = client.generate(prompt, json_mode=json_mode, temperature=temperature)
     cache_file.write_text(result, encoding="utf-8")
     return result
 
@@ -436,6 +516,32 @@ def parse_routing_response(raw: str, max_analyses: int = 3) -> list[str]:
 # --------------------------------------------------------------------------- #
 
 
+def select_default_analyses(df: pd.DataFrame, max_analyses: int = 3) -> list[str]:
+    """Pick analyses from the data's own shape, with no LLM in the loop.
+
+    Used by --offline and as the fallback when a routing call fails. The
+    previous behaviour hardcoded correlation + outliers, which meant three of
+    the five routines were unreachable without an API key — they could not be
+    demoed, and CI never exercised them. Ordered by how much a reader
+    typically learns from the result.
+    """
+    numeric_cols = df.select_dtypes("number").columns
+    selected: list[str] = []
+
+    if len(numeric_cols) >= 2:
+        selected.append("correlation")
+    if len(numeric_cols) >= 1:
+        selected.append("outliers")
+    if find_time_column(df) is not None and len(numeric_cols) >= 2:
+        selected.append("time_series")
+    if any(1 < df[c].nunique(dropna=True) <= 50 for c in df.select_dtypes(exclude="number")):
+        selected.append("category_analysis")
+    if len(numeric_cols) >= 2 and len(df) >= 10:
+        selected.append("clustering")
+
+    return selected[:max_analyses] or ["outliers"]
+
+
 def run_correlation(df: pd.DataFrame, out_dir: Path) -> dict:
     """Pearson correlation heatmap across all numeric columns."""
     numeric_df = df.select_dtypes("number")
@@ -464,6 +570,14 @@ def run_correlation(df: pd.DataFrame, out_dir: Path) -> dict:
         "top_correlations": [{"a": a, "b": b, "r": round(r, 3)} for a, b, r in pairs[:5]],
         "chart": str(chart_path),
     }
+
+
+def sample_for_plot(frame: pd.DataFrame, cap: int = MAX_PLOT_ROWS) -> pd.DataFrame:
+    """Downsample rows for rendering. Statistics are never computed from this."""
+    if len(frame) <= cap:
+        return frame
+    log.info("Sampling %d of %d rows for plotting.", cap, len(frame))
+    return frame.sample(cap, random_state=PLOT_SAMPLE_SEED)
 
 
 def iqr_bounds(series: pd.Series) -> tuple[float, float]:
@@ -507,7 +621,8 @@ def run_outliers(df: pd.DataFrame, out_dir: Path) -> dict:
     if not z_frames:
         return {"skipped": True, "reason": "No variance in numeric columns"}
 
-    plot_df = pd.concat(z_frames, ignore_index=True)
+    # Counts above came from every row; only the rendering is sampled.
+    plot_df = sample_for_plot(pd.concat(z_frames, ignore_index=True))
     fig, ax = plt.subplots(figsize=(9, max(4, 0.5 * len(outlier_counts))))
     sns.boxplot(data=plot_df, x="z", y="feature", ax=ax, orient="h")
     ax.set_title("Outlier Structure Across Key Numeric Features (z-scored)")
@@ -601,6 +716,10 @@ def run_clustering(df: pd.DataFrame, out_dir: Path) -> dict:
 
     if len(data) < 10:
         return {"skipped": True, "reason": "Not enough rows for clustering"}
+
+    # K-Means and silhouette both scale badly; cluster a representative sample
+    # rather than every row of a multi-million-row file.
+    data = sample_for_plot(data)
 
     scaler = StandardScaler()
     scaled = scaler.fit_transform(data)
@@ -745,7 +864,7 @@ def run_category_analysis(df: pd.DataFrame, out_dir: Path, top_n: int = 8) -> di
     }
 
 
-ANALYSIS_FUNCS: dict[str, Callable[[pd.DataFrame, Path], dict]] = {
+ANALYSIS_FUNCS: dict[str, Callable[..., dict]] = {
     "correlation": run_correlation,
     "outliers": run_outliers,
     "clustering": run_clustering,
@@ -835,13 +954,117 @@ def build_fallback_narrative(profile: dict, results: dict[str, dict], dataset_na
     return "\n".join(lines)
 
 
-def generate_narrative(client: GeminiClient, profile: dict, results: dict, dataset_name: str, use_cache: bool) -> str:
+def generate_narrative(
+    client: GeminiClient,
+    profile: dict,
+    results: dict,
+    dataset_name: str,
+    use_cache: bool,
+    cache_dir: Path | None = None,
+) -> str:
     prompt = build_narrative_prompt(profile, results, dataset_name)
     try:
-        return cached_generate(client, prompt, use_cache=use_cache)
+        return cached_generate(
+            client,
+            prompt,
+            use_cache=use_cache,
+            cache_dir=cache_dir,
+            temperature=NARRATIVE_TEMPERATURE,
+        )
     except AutolysisError:
         log.warning("Narrative generation failed; falling back to a templated report.")
         return build_fallback_narrative(profile, results, dataset_name)
+
+
+ALLOWED_HTML_TAGS = frozenset(
+    {
+        "h1", "h2", "h3", "h4", "h5", "h6", "p", "br", "hr", "em", "strong",
+        "code", "pre", "blockquote", "ul", "ol", "li", "table", "thead",
+        "tbody", "tr", "th", "td", "a", "img", "del", "sup", "sub",
+    }
+)
+ALLOWED_HTML_ATTRS = {
+    "a": {"href", "title"},
+    "img": {"src", "alt", "title"},
+    "th": {"align"},
+    "td": {"align"},
+}
+SAFE_URL_SCHEMES = frozenset({"http", "https", "mailto"})
+VOID_HTML_TAGS = frozenset({"br", "hr", "img"})
+
+# For these, dropping the tag is not enough — their *contents* are code or
+# markup, not prose, and surfacing a script body as visible text is merely a
+# different kind of wrong. Everything between the tags is discarded.
+DROP_CONTENT_TAGS = frozenset(
+    {"script", "style", "iframe", "object", "embed", "noscript", "template", "svg", "math"}
+)
+
+
+def _is_safe_url(value: str) -> bool:
+    """Allow relative URLs (the charts) and vetted schemes; reject the rest."""
+    candidate = value.strip().lower().replace("\t", "").replace("\n", "")
+    if ":" not in candidate.split("/")[0]:
+        return True  # relative, e.g. correlation_heatmap.png
+    scheme = candidate.split(":", 1)[0]
+    return scheme in SAFE_URL_SCHEMES
+
+
+class _HTMLSanitizer(HTMLParser):
+    """Rebuild HTML keeping only allowlisted tags, attributes and URL schemes.
+
+    The report body is model-generated text rendered to HTML and then, often,
+    shared. python-markdown passes raw HTML straight through, so without this
+    a narrative containing <script> would execute in whoever opens the file.
+    An allowlist is used rather than a blocklist because the set of dangerous
+    constructs is open-ended and the set of tags a report needs is not.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self._suppressed = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in DROP_CONTENT_TAGS:
+            self._suppressed += 1
+            return
+        if self._suppressed or tag not in ALLOWED_HTML_TAGS:
+            return
+        allowed = ALLOWED_HTML_ATTRS.get(tag, set())
+        rendered = []
+        for name, value in attrs:
+            if name not in allowed or value is None:
+                continue  # drops every on* handler, style, srcset, ...
+            if name in {"href", "src"} and not _is_safe_url(value):
+                continue  # javascript:, vbscript:, data:, ...
+            rendered.append(f' {name}="{html.escape(value, quote=True)}"')
+        closing = " /" if tag in VOID_HTML_TAGS else ""
+        self.parts.append(f"<{tag}{''.join(rendered)}{closing}>")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in DROP_CONTENT_TAGS:
+            self._suppressed = max(0, self._suppressed - 1)
+            return
+        if self._suppressed:
+            return
+        if tag in ALLOWED_HTML_TAGS and tag not in VOID_HTML_TAGS:
+            self.parts.append(f"</{tag}>")
+
+    def handle_data(self, data: str) -> None:
+        if self._suppressed:
+            return
+        self.parts.append(html.escape(data, quote=False))
+
+    def get_html(self) -> str:
+        return "".join(self.parts)
+
+
+def sanitize_html(markup: str) -> str:
+    """Strip anything outside the allowlist from rendered report HTML."""
+    sanitizer = _HTMLSanitizer()
+    sanitizer.feed(markup)
+    sanitizer.close()
+    return sanitizer.get_html()
 
 
 def export_html(readme_path: Path) -> Path | None:
@@ -850,7 +1073,8 @@ def export_html(readme_path: Path) -> Path | None:
         log.warning("The 'markdown' package is not installed; skipping --html export.")
         return None
 
-    html_body = _markdown_lib.markdown(readme_path.read_text(encoding="utf-8"), extensions=["tables"])
+    rendered = _markdown_lib.markdown(readme_path.read_text(encoding="utf-8"), extensions=["tables"])
+    html_body = sanitize_html(rendered)
     html_doc = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -870,7 +1094,7 @@ def export_html(readme_path: Path) -> Path | None:
 {html_body}
 </body>
 </html>"""
-    html_path = readme_path.with_suffix(".html").with_name("report.html")
+    html_path = readme_path.with_name("report.html")
     html_path.write_text(html_doc, encoding="utf-8")
     return html_path
 
@@ -923,25 +1147,38 @@ def run_pipeline(csv_path: Path, config: Config) -> Path:
 
     client: GeminiClient | None = None
     if config.offline:
-        log.info("Running in --offline mode: skipping LLM routing, using default analyses.")
-        selected = ["correlation", "outliers"]
+        selected = select_default_analyses(df, config.max_analyses)
+        log.info("Running in --offline mode; analyses chosen from data shape: %s", ", ".join(selected))
     else:
         client = GeminiClient(config.api_key, config.model)
         routing_prompt = build_routing_prompt(profile, config.max_analyses)
         try:
-            raw = cached_generate(client, routing_prompt, json_mode=True, use_cache=config.use_cache)
+            raw = cached_generate(
+                client,
+                routing_prompt,
+                json_mode=True,
+                use_cache=config.use_cache,
+                cache_dir=config.cache_dir,
+                temperature=ROUTING_TEMPERATURE,
+            )
             selected = parse_routing_response(raw, config.max_analyses)
             log.info("LLM selected analyses: %s", ", ".join(selected))
         except AutolysisError as exc:
-            log.warning("Routing call failed (%s); defaulting to correlation + outliers.", exc)
-            selected = ["correlation", "outliers"]
+            selected = select_default_analyses(df, config.max_analyses)
+            log.warning("Routing call failed (%s); falling back to %s.", exc, ", ".join(selected))
+
+    # Only category_analysis takes tuning today; keeping this a per-analysis
+    # mapping means the next configurable routine does not need a new call path.
+    analysis_kwargs: dict[str, dict[str, Any]] = {
+        "category_analysis": {"top_n": config.top_n_categories},
+    }
 
     results: dict[str, dict] = {}
     for name in selected:
         func = ANALYSIS_FUNCS[name]
         log.info("Running analysis: %s", name)
         try:
-            results[name] = func(df, out_dir)
+            results[name] = func(df, out_dir, **analysis_kwargs.get(name, {}))
         except Exception as exc:  # noqa: BLE001 - any routine failure must not crash the pipeline
             log.exception("Analysis '%s' raised an unexpected error; skipping.", name)
             results[name] = {"skipped": True, "reason": str(exc)}
@@ -950,7 +1187,9 @@ def run_pipeline(csv_path: Path, config: Config) -> Path:
     if config.offline or client is None:
         narrative = build_fallback_narrative(profile, results, csv_path.stem)
     else:
-        narrative = generate_narrative(client, profile, results, csv_path.stem, config.use_cache)
+        narrative = generate_narrative(
+            client, profile, results, csv_path.stem, config.use_cache, config.cache_dir
+        )
 
     readme_path = out_dir / "README.md"
     readme_path.write_text(narrative, encoding="utf-8")
@@ -985,15 +1224,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--max-analyses", type=int, default=3,
-        help="Maximum number of analyses the LLM may select (default: 3)",
+        help="Maximum number of analyses to run (default: 3)",
+    )
+    parser.add_argument(
+        "--top-categories", type=int, default=8,
+        help="Bars to show in the category frequency chart (default: 8)",
     )
     parser.add_argument(
         "--offline", action="store_true",
-        help="Skip all LLM calls; run default analyses and write a templated report.",
+        help="Skip all LLM calls; choose analyses from the data shape and write "
+             "a templated report.",
     )
     parser.add_argument(
         "--cache", action="store_true",
-        help="Cache LLM responses on disk (.autolysis_cache/) to avoid repeat API calls.",
+        help="Cache LLM responses on disk (AUTOLYSIS_CACHE_DIR, default "
+             "./.autolysis_cache) to avoid repeat API calls; entries expire after 7 days.",
     )
     parser.add_argument(
         "--html", action="store_true",
@@ -1021,8 +1266,6 @@ def main(argv: list[str] | None = None) -> int:
     except AuthenticationError as exc:
         log.error(str(exc))
         return 1
-
-    config.output_dir = args.output_dir or Path(f"{args.csv_path.stem}_output")
 
     start = time.time()
     try:
