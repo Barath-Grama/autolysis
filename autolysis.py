@@ -118,6 +118,16 @@ CACHE_TTL_SECONDS = 7 * 24 * 3600  # a week; prompts and models both drift
 ROUTING_TEMPERATURE = 0.0
 NARRATIVE_TEMPERATURE = 0.4
 
+# Constrained decoding for the routing call: the API itself refuses to emit a
+# value outside the vocabulary, so a non-compliant response is prevented rather
+# than filtered. parse_routing_response still runs behind it — the schema is
+# only honoured on the paths that support it, and the parser also handles the
+# fallback path where routing failed entirely.
+ROUTING_RESPONSE_SCHEMA: dict[str, Any] = {
+    "type": "array",
+    "items": {"type": "string", "enum": ANALYSIS_VOCAB},
+}
+
 log = logging.getLogger("autolysis")
 
 
@@ -222,6 +232,85 @@ def load_config(args: argparse.Namespace) -> Config:
 
 
 # --------------------------------------------------------------------------- #
+# Token and cost accounting
+# --------------------------------------------------------------------------- #
+
+# USD per 1M tokens, as (input, output). These are estimates for reporting, not
+# billing: Google revises published rates, and this table is only as fresh as
+# the last person to check it. Override with AUTOLYSIS_PRICE_INPUT /
+# AUTOLYSIS_PRICE_OUTPUT when it drifts. An unknown model reports tokens only,
+# which is preferable to quoting a confident wrong number.
+MODEL_PRICING_USD_PER_MTOK: dict[str, tuple[float, float]] = {
+    "gemini-2.5-flash-lite": (0.10, 0.40),
+    "gemini-2.5-flash": (0.30, 2.50),
+    "gemini-2.5-pro": (1.25, 10.00),
+}
+
+
+def pricing_for(model: str) -> tuple[float, float] | None:
+    """Resolve (input, output) USD per 1M tokens for a model, or None."""
+    override_in = os.environ.get("AUTOLYSIS_PRICE_INPUT")
+    override_out = os.environ.get("AUTOLYSIS_PRICE_OUTPUT")
+    if override_in and override_out:
+        try:
+            return float(override_in), float(override_out)
+        except ValueError:
+            log.warning("Ignoring non-numeric AUTOLYSIS_PRICE_INPUT/OUTPUT.")
+
+    # Longest prefix wins, so 'gemini-2.5-flash-lite' is not matched by the
+    # shorter 'gemini-2.5-flash' entry.
+    for name in sorted(MODEL_PRICING_USD_PER_MTOK, key=len, reverse=True):
+        if model.startswith(name):
+            return MODEL_PRICING_USD_PER_MTOK[name]
+    return None
+
+
+@dataclass
+class Usage:
+    """Tokens consumed across a run, and what they plausibly cost.
+
+    An LLM tool that cannot say what it spent is hard to operate. Token counts
+    come from the API's own usageMetadata rather than a local estimate, so they
+    are exact; only the money is an approximation.
+    """
+
+    calls: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+    def record(self, metadata: dict | None) -> None:
+        self.calls += 1
+        if not metadata:
+            return  # older API versions, or a mocked response
+        self.input_tokens += int(metadata.get("promptTokenCount") or 0)
+        self.output_tokens += int(metadata.get("candidatesTokenCount") or 0)
+
+    @property
+    def total_tokens(self) -> int:
+        return self.input_tokens + self.output_tokens
+
+    def estimated_cost_usd(self, model: str) -> float | None:
+        rates = pricing_for(model)
+        if rates is None:
+            return None
+        input_rate, output_rate = rates
+        return (self.input_tokens * input_rate + self.output_tokens * output_rate) / 1_000_000
+
+    def summary(self, model: str) -> str:
+        """One line, with the rate visible so a stale price is obvious."""
+        base = (
+            f"{self.calls} LLM call{'s' if self.calls != 1 else ''}, "
+            f"{self.input_tokens:,} in / {self.output_tokens:,} out "
+            f"({self.total_tokens:,} tokens)"
+        )
+        rates = pricing_for(model)
+        cost = self.estimated_cost_usd(model)
+        if cost is None:
+            return f"{base}; no published rate for '{model}', cost not estimated"
+        return f"{base}; ~${cost:.6f} at ${rates[0]:.2f}/${rates[1]:.2f} per 1M"
+
+
+# --------------------------------------------------------------------------- #
 # Gemini client
 # --------------------------------------------------------------------------- #
 
@@ -247,9 +336,15 @@ class GeminiClient:
         self.max_retries = max_retries
         self.timeout = timeout
         self.base_delay = base_delay
+        self.usage = Usage()
 
     def generate(
-        self, prompt: str, *, json_mode: bool = False, temperature: float = NARRATIVE_TEMPERATURE
+        self,
+        prompt: str,
+        *,
+        json_mode: bool = False,
+        temperature: float = NARRATIVE_TEMPERATURE,
+        response_schema: dict | None = None,
     ) -> str:
         """Send a single-turn prompt to Gemini and return the text response."""
         # The key travels in a header, never the URL: httpx embeds the full URL
@@ -260,6 +355,10 @@ class GeminiClient:
         generation_config: dict[str, Any] = {"temperature": temperature}
         if json_mode:
             generation_config["responseMimeType"] = "application/json"
+        if response_schema is not None:
+            # Constrains decoding to the schema, so the closed vocabulary is
+            # enforced by the API rather than only by our parser afterwards.
+            generation_config["responseSchema"] = response_schema
 
         payload = {
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
@@ -281,7 +380,9 @@ class GeminiClient:
                     )
 
                 resp.raise_for_status()
-                return _extract_text(resp.json())
+                body = resp.json()
+                self.usage.record(body.get("usageMetadata"))
+                return _extract_text(body)
 
             except AuthenticationError:
                 raise
@@ -360,10 +461,15 @@ def _extract_text(data: dict) -> str:
         ) from exc
 
 
-def _cache_key(prompt: str, model: str, json_mode: bool = False) -> str:
-    # json_mode changes the response format, so it has to be part of the
-    # identity of the entry or the two modes collide on one file.
-    return hashlib.sha256(f"{model}:{int(json_mode)}:{prompt}".encode()).hexdigest()
+def _cache_key(
+    prompt: str, model: str, json_mode: bool = False, schema: dict | None = None
+) -> str:
+    # json_mode and the schema both change the response format, so both belong
+    # in the identity of the entry or different shapes collide on one file.
+    schema_part = "" if schema is None else json.dumps(schema, sort_keys=True)
+    return hashlib.sha256(
+        f"{model}:{int(json_mode)}:{schema_part}:{prompt}".encode()
+    ).hexdigest()
 
 
 def cached_generate(
@@ -374,6 +480,7 @@ def cached_generate(
     use_cache: bool = False,
     cache_dir: Path | None = None,
     temperature: float = NARRATIVE_TEMPERATURE,
+    response_schema: dict | None = None,
 ) -> str:
     """Call the Gemini client, transparently caching responses to disk when enabled.
 
@@ -383,11 +490,13 @@ def cached_generate(
     stale answer from a model that has since changed.
     """
     if not use_cache:
-        return client.generate(prompt, json_mode=json_mode, temperature=temperature)
+        return client.generate(
+            prompt, json_mode=json_mode, temperature=temperature, response_schema=response_schema
+        )
 
     cache_dir = cache_dir or CACHE_DIR
     cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_file = cache_dir / f"{_cache_key(prompt, client.model, json_mode)}.txt"
+    cache_file = cache_dir / f"{_cache_key(prompt, client.model, json_mode, response_schema)}.txt"
 
     if cache_file.exists():
         age = time.time() - cache_file.stat().st_mtime
@@ -396,7 +505,9 @@ def cached_generate(
             return cache_file.read_text(encoding="utf-8")
         log.debug("Cache entry %s expired (%.1f h old)", cache_file.name, age / 3600)
 
-    result = client.generate(prompt, json_mode=json_mode, temperature=temperature)
+    result = client.generate(
+        prompt, json_mode=json_mode, temperature=temperature, response_schema=response_schema
+    )
     cache_file.write_text(result, encoding="utf-8")
     return result
 
@@ -1377,6 +1488,7 @@ def run_pipeline(csv_path: Path, config: Config) -> Path:
                 use_cache=config.use_cache,
                 cache_dir=config.cache_dir,
                 temperature=ROUTING_TEMPERATURE,
+                response_schema=ROUTING_RESPONSE_SCHEMA,
             )
             selected = parse_routing_response(raw, config.max_analyses)
             log.info("LLM selected analyses: %s", ", ".join(selected))
@@ -1416,6 +1528,9 @@ def run_pipeline(csv_path: Path, config: Config) -> Path:
         html_path = export_html(readme_path)
         if html_path:
             log.info("Wrote %s", html_path)
+
+    if client is not None and client.usage.calls:
+        log.info("Usage: %s", client.usage.summary(config.model))
 
     return out_dir
 

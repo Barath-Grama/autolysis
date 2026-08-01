@@ -140,6 +140,7 @@ options:
 | `GEMINI_API_KEY` / `GOOGLE_API_KEY` | Gemini API key (required unless `--offline`) |
 | `GEMINI_MODEL`                  | Overrides the default model (`gemini-2.5-flash-lite`) |
 | `AUTOLYSIS_CACHE_DIR`           | Where `--cache` writes (default `./.autolysis_cache`) |
+| `AUTOLYSIS_PRICE_INPUT` / `AUTOLYSIS_PRICE_OUTPUT` | USD per 1M tokens, overriding the built-in rate table |
 
 A `.env` file in the working directory is loaded automatically; real
 environment variables always take precedence over it. Copy `.env.example` to
@@ -197,7 +198,7 @@ pip install -r requirements.txt
 pytest tests/ -v
 ```
 
-All 101 tests mock the Gemini API (`unittest.mock`), so the suite runs fully
+All 127 tests mock the Gemini API (`unittest.mock`), so the suite runs fully
 offline and deterministically. Coverage includes:
 
 - IQR outlier boundary correctness (equivalence partitioning at the Tukey fence)
@@ -213,6 +214,12 @@ offline and deterministically. Coverage includes:
 - CSV encoding fallback: latin-1/cp1252 input is decoded rather than crashing,
   UTF-8 still takes precedence, malformed CSVs raise a clean error
 - `--max-analyses` propagating from the CLI into the routing prompt itself
+- Token accounting: accumulation across calls, a missing `usageMetadata`,
+  environment price overrides, and the longest-prefix rule that stops
+  `gemini-2.5-flash-lite` being billed at `gemini-2.5-flash` rates
+- The routing schema reaching the request payload, the narrative call
+  deliberately *not* being schema-constrained, and the parser still rejecting
+  an out-of-vocabulary value if one ever arrives
 - Clustering axis selection being scale-free: rescaling a column's units must
   not reshuffle the ranking, and structured columns must outrank plain noise
 - Silhouette k-selection recovering 2, 3 and 5 clusters from known blobs —
@@ -235,9 +242,27 @@ offline and deterministically. Coverage includes:
 
 - **Two LLM calls, not more.** Call #1 sends only column-level metadata and
   gets back a JSON array of analysis identifiers drawn from a closed
-  vocabulary, so a non-compliant response can never trigger an unsupported
-  routine. Call #2 sends the computed numeric results and chart filenames and
-  gets back the final Markdown narrative.
+  vocabulary. Call #2 sends the computed numeric results and chart filenames
+  and gets back the final Markdown narrative.
+- **Schema-constrained routing, with a parser behind it.** Call #1 passes a
+  `responseSchema` of `array<enum>`, so the API constrains decoding to the
+  vocabulary and an unsupported routine cannot be named in the first place.
+  `parse_routing_response` still runs afterwards — the schema is enforced
+  server-side and only on the paths that support it, while the parser also
+  covers the case where the call failed and a malformed body came back. Two
+  independent guarantees, neither relying on the model behaving.
+- **Every run reports what it spent.** Token counts come from the API's own
+  `usageMetadata`, so they are exact rather than estimated locally:
+
+  ```
+  Usage: 2 LLM calls, 1,370 in / 1,211 out (2,581 tokens); ~$0.000621 at $0.10/$0.40 per 1M
+  ```
+
+  The rate is printed alongside the figure so a stale price is visible rather
+  than silently wrong, and an unrecognised model reports tokens with no cost at
+  all instead of quoting a confident guess. Override the built-in table with
+  `AUTOLYSIS_PRICE_INPUT` / `AUTOLYSIS_PRICE_OUTPUT`; the shipped rates are for
+  reporting, not billing.
 
 <a name="what-gets-sent"></a>
 - **What gets sent.** Column names, dtypes, null percentages, numeric

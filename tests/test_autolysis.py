@@ -1235,5 +1235,181 @@ def test_bad_key_does_not_silently_degrade_to_an_offline_report(tmp_path, monkey
     assert not (out / "README.md").exists(), "a rejected key must not yield a report"
 
 
+# --------------------------------------------------------------------------- #
+# Token and cost accounting
+# --------------------------------------------------------------------------- #
+
+
+def test_usage_accumulates_across_calls():
+    usage = autolysis.Usage()
+    usage.record({"promptTokenCount": 1000, "candidatesTokenCount": 200})
+    usage.record({"promptTokenCount": 500, "candidatesTokenCount": 100})
+    assert usage.calls == 2
+    assert usage.input_tokens == 1500
+    assert usage.output_tokens == 300
+    assert usage.total_tokens == 1800
+
+
+def test_usage_tolerates_a_response_without_metadata():
+    """Mocked responses and older API versions carry no usageMetadata."""
+    usage = autolysis.Usage()
+    usage.record(None)
+    usage.record({})
+    assert usage.calls == 2
+    assert usage.total_tokens == 0
+
+
+def test_usage_cost_uses_the_published_rate():
+    usage = autolysis.Usage(calls=1, input_tokens=1_000_000, output_tokens=1_000_000)
+    rates = autolysis.MODEL_PRICING_USD_PER_MTOK["gemini-2.5-flash-lite"]
+    assert usage.estimated_cost_usd("gemini-2.5-flash-lite") == pytest.approx(sum(rates))
+
+
+def test_pricing_prefers_the_longest_matching_prefix():
+    """'gemini-2.5-flash-lite' must not be priced as 'gemini-2.5-flash'."""
+    assert autolysis.pricing_for("gemini-2.5-flash-lite") != autolysis.pricing_for("gemini-2.5-flash")
+    assert autolysis.pricing_for("gemini-2.5-flash-lite-preview-09-2025") == (
+        autolysis.MODEL_PRICING_USD_PER_MTOK["gemini-2.5-flash-lite"]
+    )
+
+
+def test_unknown_model_reports_tokens_but_not_a_made_up_cost():
+    usage = autolysis.Usage(calls=1, input_tokens=100, output_tokens=50)
+    assert usage.estimated_cost_usd("some-future-model") is None
+    summary = usage.summary("some-future-model")
+    assert "100" in summary and "50" in summary
+    assert "$" not in summary.split("cost not estimated")[0].replace("cost not estimated", "")
+
+
+def test_price_override_from_environment(monkeypatch):
+    monkeypatch.setenv("AUTOLYSIS_PRICE_INPUT", "2.00")
+    monkeypatch.setenv("AUTOLYSIS_PRICE_OUTPUT", "6.00")
+    assert autolysis.pricing_for("gemini-2.5-flash-lite") == (2.00, 6.00)
+
+    usage = autolysis.Usage(calls=1, input_tokens=1_000_000, output_tokens=0)
+    assert usage.estimated_cost_usd("gemini-2.5-flash-lite") == pytest.approx(2.00)
+
+
+def test_bad_price_override_falls_back_to_the_table(monkeypatch):
+    monkeypatch.setenv("AUTOLYSIS_PRICE_INPUT", "not-a-number")
+    monkeypatch.setenv("AUTOLYSIS_PRICE_OUTPUT", "6.00")
+    assert autolysis.pricing_for("gemini-2.5-flash-lite") == (0.10, 0.40)
+
+
+def test_summary_shows_the_rate_so_a_stale_price_is_visible():
+    usage = autolysis.Usage(calls=2, input_tokens=1432, output_tokens=987)
+    summary = usage.summary("gemini-2.5-flash-lite")
+    assert "2 LLM calls" in summary
+    assert "1,432 in / 987 out" in summary
+    assert "per 1M" in summary
+
+
+def test_client_records_usage_from_the_response():
+    client = autolysis.GeminiClient(api_key="k")
+
+    def responder(url, json=None, headers=None):
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", url),
+            json={
+                "candidates": [{"content": {"parts": [{"text": "hi"}]}}],
+                "usageMetadata": {"promptTokenCount": 42, "candidatesTokenCount": 7},
+            },
+        )
+
+    with patch("httpx.Client", return_value=_mock_httpx_client(responder)):
+        client.generate("hello")
+
+    assert client.usage.calls == 1
+    assert client.usage.input_tokens == 42
+    assert client.usage.output_tokens == 7
+
+
+# --------------------------------------------------------------------------- #
+# Structured routing output
+# --------------------------------------------------------------------------- #
+
+
+def test_routing_schema_covers_exactly_the_vocabulary():
+    schema = autolysis.ROUTING_RESPONSE_SCHEMA
+    assert schema["type"] == "array"
+    assert schema["items"]["enum"] == autolysis.ANALYSIS_VOCAB
+
+
+def test_routing_call_sends_the_schema(tmp_path, synthetic_df):
+    csv_path = tmp_path / "s.csv"
+    synthetic_df.to_csv(csv_path, index=False)
+
+    with patch.object(autolysis.GeminiClient, "generate") as mock_generate:
+        mock_generate.side_effect = ['["correlation"]', "# R\n\ntext."]
+        autolysis.run_pipeline(csv_path, autolysis.Config(api_key="k", output_dir=tmp_path / "out"))
+
+    routing_kwargs = mock_generate.call_args_list[0].kwargs
+    narrative_kwargs = mock_generate.call_args_list[1].kwargs
+    assert routing_kwargs["response_schema"] == autolysis.ROUTING_RESPONSE_SCHEMA
+    # The narrative is prose; constraining it to a schema would be wrong.
+    assert narrative_kwargs.get("response_schema") is None
+
+
+def test_schema_reaches_the_request_payload():
+    client = autolysis.GeminiClient(api_key="k")
+    seen = {}
+
+    def responder(url, json=None, headers=None):
+        seen.update(json)
+        return httpx.Response(
+            200, request=httpx.Request("POST", url),
+            json={"candidates": [{"content": {"parts": [{"text": "[]"}]}}]},
+        )
+
+    with patch("httpx.Client", return_value=_mock_httpx_client(responder)):
+        client.generate("p", json_mode=True, response_schema=autolysis.ROUTING_RESPONSE_SCHEMA)
+
+    config = seen["generationConfig"]
+    assert config["responseSchema"] == autolysis.ROUTING_RESPONSE_SCHEMA
+    assert config["responseMimeType"] == "application/json"
+
+
+def test_cache_key_separates_different_schemas():
+    """A schema changes the response shape, so it must change the entry."""
+    a = autolysis._cache_key("p", "m", True, autolysis.ROUTING_RESPONSE_SCHEMA)
+    b = autolysis._cache_key("p", "m", True, None)
+    c = autolysis._cache_key("p", "m", True, {"type": "array", "items": {"type": "string"}})
+    assert len({a, b, c}) == 3
+
+
+def test_parser_still_guards_a_schema_violating_response():
+    """Belt and braces: the schema is enforced server-side, the parser locally."""
+    assert autolysis.parse_routing_response('["correlation", "not_a_real_analysis"]') == [
+        "correlation"
+    ]
+
+
+def test_readme_test_count_matches_reality(request):
+    """The README states a test count; drift makes every other claim suspect.
+
+    Only meaningful on a full run: testscollected reflects this session, so a
+    filtered run would otherwise report a spurious mismatch and train everyone
+    to ignore the check.
+    """
+    config = request.config
+    selected = (
+        config.option.keyword
+        or config.option.markexpr
+        or any("::" in str(arg) for arg in config.invocation_params.args)
+    )
+    if selected:
+        pytest.skip("test selection active; the count check needs the full suite")
+
+    readme = Path(__file__).resolve().parent.parent / "README.md"
+    claimed = re.search(r"All (\d+) tests mock", readme.read_text(encoding="utf-8"))
+    assert claimed, "the README no longer states a test count"
+
+    actual = request.session.testscollected
+    assert int(claimed.group(1)) == actual, (
+        f"README claims {claimed.group(1)} tests, suite collected {actual}"
+    )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
