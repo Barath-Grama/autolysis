@@ -1,6 +1,7 @@
 # Autolysis
 
 [![CI](https://github.com/Barath-Grama/autolysis/actions/workflows/ci.yml/badge.svg)](https://github.com/Barath-Grama/autolysis/actions/workflows/ci.yml)
+[![coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/Barath-Grama/autolysis/badges/coverage.json)](https://github.com/Barath-Grama/autolysis/actions/workflows/ci.yml)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
