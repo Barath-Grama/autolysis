@@ -203,7 +203,8 @@ completes and always produces a report.
 ```
 autolysis.py           # the entire pipeline — single, uv-executable script
 tests/
-  test_autolysis.py    # unit tests (all Gemini calls mocked, no network needed)
+  test_autolysis.py    # pipeline unit tests (all Gemini calls mocked)
+  test_routing_eval.py # tests for the eval harness itself
 sample_data/
   goodreads.csv        # synthetic book-metadata dataset for demos
   happiness.csv        # synthetic multi-year, multi-country wellbeing dataset
@@ -214,6 +215,7 @@ evals/
 docs/
   example/             # a real Gemini run, embedded above
     README.md          # the narrated report
+    report.html        # the same report via --html, sanitised for sharing
     *.png              # the charts the model's chosen analyses produced
   example-offline/     # the same dataset with no API key, for comparison
 .github/workflows/
@@ -221,6 +223,7 @@ docs/
 requirements.txt       # pinned deps for non-uv / pip workflows
 pyproject.toml         # packaging, pytest, coverage and ruff config
 .env.example           # environment variable template
+LICENSE                # MIT
 ```
 
 > **Note on sample data:** `sample_data/*.csv` are synthetically generated
