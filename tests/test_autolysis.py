@@ -28,8 +28,7 @@ import pandas as pd
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-import autolysis  # noqa: E402
-
+import autolysis
 
 # --------------------------------------------------------------------------- #
 # Fixtures
@@ -380,9 +379,8 @@ def test_gemini_client_retries_then_raises_autolysis_error():
     mock_client.__enter__.return_value = mock_client
     mock_client.post.side_effect = httpx.TransportError("network down")
 
-    with patch("httpx.Client", return_value=mock_client):
-        with pytest.raises(autolysis.AutolysisError):
-            client.generate("hello")
+    with patch("httpx.Client", return_value=mock_client), pytest.raises(autolysis.AutolysisError):
+        client.generate("hello")
 
 
 def test_extract_text_raises_on_bad_shape():
@@ -448,9 +446,11 @@ def test_api_key_never_appears_in_raised_error():
         req = httpx.Request("POST", url)
         return httpx.Response(500, request=req, text="upstream boom")
 
-    with patch("httpx.Client", return_value=_mock_httpx_client(server_error)):
-        with pytest.raises(autolysis.AutolysisError) as excinfo:
-            client.generate("hello")
+    with (
+        patch("httpx.Client", return_value=_mock_httpx_client(server_error)),
+        pytest.raises(autolysis.AutolysisError) as excinfo,
+    ):
+        client.generate("hello")
 
     # The URL no longer carries the key at all, so there is nothing left to
     # scrub — absence is the assertion that matters, not the redaction marker.
@@ -604,9 +604,11 @@ def test_non_retryable_status_fails_immediately(status):
         calls.append(1)
         return httpx.Response(status, request=httpx.Request("POST", url), text="nope")
 
-    with patch("httpx.Client", return_value=_mock_httpx_client(responder)):
-        with pytest.raises(autolysis.AutolysisError, match="not retryable"):
-            client.generate("hello")
+    with (
+        patch("httpx.Client", return_value=_mock_httpx_client(responder)),
+        pytest.raises(autolysis.AutolysisError, match="not retryable"),
+    ):
+        client.generate("hello")
 
     assert len(calls) == 1
 
@@ -620,9 +622,11 @@ def test_retryable_status_is_retried(status):
         calls.append(1)
         return httpx.Response(status, request=httpx.Request("POST", url), text="later")
 
-    with patch("httpx.Client", return_value=_mock_httpx_client(responder)):
-        with pytest.raises(autolysis.AutolysisError):
-            client.generate("hello")
+    with (
+        patch("httpx.Client", return_value=_mock_httpx_client(responder)),
+        pytest.raises(autolysis.AutolysisError),
+    ):
+        client.generate("hello")
 
     assert len(calls) == 3
 
@@ -635,10 +639,12 @@ def test_retry_after_header_is_honoured():
             429, request=httpx.Request("POST", url), headers={"Retry-After": "0.01"}
         )
 
-    with patch("httpx.Client", return_value=_mock_httpx_client(responder)):
-        with patch("time.sleep") as mock_sleep:
-            with pytest.raises(autolysis.AutolysisError):
-                client.generate("hello")
+    with (
+        patch("httpx.Client", return_value=_mock_httpx_client(responder)),
+        patch("time.sleep") as mock_sleep,
+        pytest.raises(autolysis.AutolysisError),
+    ):
+        client.generate("hello")
 
     # The server's 0.01s wins over our 99s backoff guess.
     assert mock_sleep.call_args_list[0].args[0] == pytest.approx(0.01)
@@ -650,9 +656,11 @@ def test_auth_error_still_short_circuits():
     def responder(url, json=None, headers=None):
         return httpx.Response(403, request=httpx.Request("POST", url))
 
-    with patch("httpx.Client", return_value=_mock_httpx_client(responder)):
-        with pytest.raises(autolysis.AuthenticationError):
-            client.generate("hello")
+    with (
+        patch("httpx.Client", return_value=_mock_httpx_client(responder)),
+        pytest.raises(autolysis.AuthenticationError),
+    ):
+        client.generate("hello")
 
 
 # --------------------------------------------------------------------------- #

@@ -41,16 +41,16 @@ import os
 import re
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import httpx
+import matplotlib
 import numpy as np
 import pandas as pd
-
-import matplotlib
 
 matplotlib.use("Agg")  # headless rendering — no display server required
 import matplotlib.pyplot as plt
@@ -342,7 +342,7 @@ def _extract_text(data: dict) -> str:
 def _cache_key(prompt: str, model: str, json_mode: bool = False) -> str:
     # json_mode changes the response format, so it has to be part of the
     # identity of the entry or the two modes collide on one file.
-    return hashlib.sha256(f"{model}:{int(json_mode)}:{prompt}".encode("utf-8")).hexdigest()
+    return hashlib.sha256(f"{model}:{int(json_mode)}:{prompt}".encode()).hexdigest()
 
 
 def cached_generate(
@@ -880,10 +880,14 @@ ANALYSIS_FUNCS: dict[str, Callable[..., dict]] = {
 
 def build_narrative_prompt(profile: dict, results: dict[str, dict], dataset_name: str) -> str:
     lines = [
-        f"You are a senior data analyst. Write a Markdown report analyzing the "
-        f"dataset '{dataset_name}'.",
-        f"The dataset has {profile['rows']} rows, {profile['cols']} columns, and "
-        f"{profile['duplicate_rows']} duplicate rows.",
+        (
+            f"You are a senior data analyst. Write a Markdown report analyzing the "
+            f"dataset '{dataset_name}'."
+        ),
+        (
+            f"The dataset has {profile['rows']} rows, {profile['cols']} columns, and "
+            f"{profile['duplicate_rows']} duplicate rows."
+        ),
         "",
         "Column summary:",
     ]
@@ -926,8 +930,10 @@ def build_fallback_narrative(profile: dict, results: dict[str, dict], dataset_na
         f"# Analysis of {dataset_name}",
         "",
         "## The Data",
-        f"This dataset contains {profile['rows']} rows and {profile['cols']} columns "
-        f"({profile['duplicate_rows']} duplicate rows detected).",
+        (
+            f"This dataset contains {profile['rows']} rows and {profile['cols']} columns "
+            f"({profile['duplicate_rows']} duplicate rows detected)."
+        ),
         "",
         "## What We Did",
     ]
@@ -1179,7 +1185,7 @@ def run_pipeline(csv_path: Path, config: Config) -> Path:
         log.info("Running analysis: %s", name)
         try:
             results[name] = func(df, out_dir, **analysis_kwargs.get(name, {}))
-        except Exception as exc:  # noqa: BLE001 - any routine failure must not crash the pipeline
+        except Exception as exc:
             log.exception("Analysis '%s' raised an unexpected error; skipping.", name)
             results[name] = {"skipped": True, "reason": str(exc)}
 

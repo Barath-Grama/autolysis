@@ -1,0 +1,112 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+# A new push to the same branch supersedes the run in flight.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: ruff
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Only the linter — no need to build pandas/scikit-learn to check style.
+      # The pin matches pyproject's dev extra so CI and local agree.
+      - name: Install ruff
+        run: pip install "ruff>=0.16,<0.17"
+
+      - name: Lint
+        run: ruff check --output-format=github .
+
+  test:
+    name: py${{ matrix.python-version }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One failing cell should not hide the results of the others.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.11", "3.12", "3.13"]
+        include:
+          # The encoding fallback and all path handling are platform-sensitive,
+          # so both non-Linux platforms get a run rather than being assumed.
+          - os: windows-latest
+            python-version: "3.12"
+          - os: macos-latest
+            python-version: "3.12"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      # matplotlib runs headless via the Agg backend set in autolysis.py, so no
+      # display server is needed on any runner.
+      - name: Test
+        run: pytest tests/ -q --cov --cov-report=term-missing --cov-fail-under=85
+
+  smoke:
+    name: end-to-end (offline)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      # Installing rather than invoking the script directly is deliberate: it
+      # is what regression-tests the console entry point, which was silently
+      # broken by setuptools flat-layout discovery until py-modules was declared.
+      - name: Install the package
+        run: pip install -e .
+
+      - name: Run the CLI on the sample data
+        run: autolysis sample_data/happiness.csv --offline --max-analyses 5 --html -o out
+
+      - name: Assert the report was actually produced
+        run: |
+          test -f out/README.md
+          test -f out/report.html
+          charts=$(find out -name '*.png' | wc -l)
+          echo "charts produced: $charts"
+          test "$charts" -ge 3
+          # The offline path must not silently regress to a stub report.
+          test "$(wc -c < out/README.md)" -gt 400
+
+      - name: Confirm the shared report carries no active content
+        run: |
+          # `! grep -q` also succeeds when the file is absent, so assert it
+          # exists here rather than relying on an earlier step to have run.
+          test -f out/report.html
+          ! grep -Eiq '<script|<iframe|onerror=|javascript:' out/report.html
+
+      - name: Upload the generated report
+        uses: actions/upload-artifact@v4
+        with:
+          name: sample-report
+          path: out/
+          if-no-files-found: error
